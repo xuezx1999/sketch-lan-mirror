@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="LAN Mirror">
+<title>Sketch LAN Mirror</title>
+<style>
+  /* ═══ 1. Reset & App Shell ═══ */
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overscroll-behavior: none; }
+  body {
+    font-family: -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
+    background: #111214;
+    color: #e8e9ea;
+    display: flex;
+    flex-direction: column;
+    /* iOS PWA 全屏关键：用 dvh 直接锚定「视觉视口」高度。
+       原先的 height:100% 链在 standalone 下偶尔失效 → body 不满屏 → #docInfo 浮在中间、下方一大段黑边；
+       position:fixed 又会破坏 immersive 的整页滚动。改用 100dvh（回退 100vh），flex 列即可正确撑满，
+       #docInfo 自然被推到 Home Indicator 上方。 */
+    height: 100vh;        /* 回退 */
+    /* 不用 calc(100dvh + 1px) 溢出技巧：它会触发 iOS 视口重算动画
+       （Stage 加高 → docInfo 下移 → 又收回），观感诡异，弃用。
+       PWA 下接受视口 = layout viewport（已排除底部 home indicator 条带），
+       由 body.pwa-strip 让 docInfo 贴住视口底 = 紧贴 Home Indicator 安全区 */
+    height: 100dvh;
+    /* App shell 负责 safe-area；Viewer content 不直接作用 safe-area padding */
+    padding: calc(env(safe-area-inset-top) + 10px) 12px 10px;
+    padding-left: calc(env(safe-area-inset-left) + 12px);
+    padding-right: calc(env(safe-area-inset-right) + 12px);
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;
+    overflow: hidden;  /* normal 模式固定视口，不滚动整页 */
+  }
+  /* PWA standalone 本身已无浏览器 chrome；但底部 home indicator 区仍要用 safe-area 让 docInfo 贴可见区底 */
+  @media (display-mode: standalone) {
+    body {
+      padding-top: calc(env(safe-area-inset-top) + 2px);
+      padding-bottom: calc(env(safe-area-inset-bottom) + 2px);
+      padding-left: calc(env(safe-area-inset-left) + 12px);
+      padding-right: calc(env(safe-area-inset-right) + 12px);
+    }
+  }
+  @media not (display-mode: standalone) {
+    body { padding-bottom: calc(env(safe-area-inset-bottom) + 10px); }
+  }
+  /* JS 检测（syncStandaloneBottom）：PWA 布局视口比物理屏矮 ≈ 底部条带高时，
+     视口已排除 home indicator 区，再叠 env(safe-area-inset-bottom) 会双重留白 →
+     收紧底部 padding，让 docInfo 贴住视口底；下方仅剩 home indicator 系统条带。
+     注意：iOS PWA 中 display-mode 媒体查询谎报 browser，必须 JS 门控 */
+  body.pwa-strip { padding-bottom: 0; }
+  body.pwa-strip #docInfo { padding-bottom: 1px; margin-bottom: 0; }
+  /* 视口已重算为全屏（gap<=15）：视口含 home indicator 区，env 正确，
+     docInfo 贴安全区上沿（覆盖浏览器模式的 env+10/env+8 双重宽松 padding） */
+  body.pwa-tight { padding-bottom: calc(env(safe-area-inset-bottom) + 2px); }
+  body.pwa-tight #docInfo { padding-bottom: 1px; margin-bottom: 0; }
+  /* 启动视口重算（bootViewportRecalc）：临时让 body 溢出 2px 触发 iOS 把视口
+     重算为全屏（复刻 immersive 可滚动 body 触发重算的机制），期间隐藏内容
+     避免重算位移可见；超时未成功则移除，回退 pwa-strip 兜底 */
+  body.pwa-boot { height: calc(100dvh + 2px); overflow-y: auto; opacity: 0; }
+
+  /* ═══ 2. Header ═══ */
+  header { display: flex; align-items: center; gap: 10px; flex: none; }
+  h1 { font-size: 15px; font-weight: 600; letter-spacing: 0.02em; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #666; flex: none; }
+  .dot.online { background: #34c759; }
+  .dot.connecting { background: #ffcc00; }
+  .dot.offline { background: #ff453a; }
+  #statusText { margin-left: auto; font-size: 12px; color: #98989d; }
+
+  /* ═══ 3. Normal Viewer（固定视口 + fit + pinch + pan）═══ */
+  main {
+    flex: 1; display: flex; flex-direction: column; min-height: 0;
+    margin-top: 6px;
+  }
+  @media (display-mode: standalone) {
+    main { margin-top: 0; }
+  }
+  #stage {
+    flex: 1; min-height: 0;
+    position: relative; overflow: hidden;
+    background: #1b1c1f;
+    border-radius: 12px;
+    touch-action: none;  /* JS 接管手势，禁止浏览器默认 pan/pinch */
+    cursor: grab;
+  }
+  #canvas {
+    position: absolute; left: 0; top: 0;
+    transform-origin: 0 0;
+    will-change: transform;
+  }
+  #normalImg { display: block; -webkit-user-drag: none; pointer-events: none; }
+  #placeholder {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: #636366; font-size: 13px; text-align: center; padding: 20px;
+  }
+
+  /* ═══ 4. Doc Info（底部信息）═══ */
+  #docInfo {
+    flex: none; margin-top: 6px;
+    padding: 0 12px 4px;
+    padding-left: calc(env(safe-area-inset-left) + 12px);
+    padding-right: calc(env(safe-area-inset-right) + 12px);
+    font-size: 12px; line-height: 1.5;
+  }
+  @media (display-mode: standalone) {
+    #docInfo { margin-top: 2px; }
+  }
+  /* browser 模式由 #docInfo 承担底部 safe-area；standalone 已在 body 侧处理 */
+  @media not (display-mode: standalone) {
+    #docInfo { padding-bottom: calc(env(safe-area-inset-bottom) + 8px); }
+  }
+  #docInfo em { font-style: normal; color: #98989d; margin-right: 5px; }
+  #docInfo b { font-weight: 400; font-variant-numeric: tabular-nums; word-break: break-all; }
+  #docInfo .sep { color: #636366; margin: 0 8px; }
+
+  /* ═══ 5. Immersive Viewer（流布局：body 可滚动，图片到物理屏底，home indicator 浮在图片上）═══ */
+  /* 默认隐藏；body.mode-immersive 时显示，header/main/footer 隐藏，body 改为可滚动 */
+  #immersiveViewer { display: none; width: 100%; }
+  body.mode-immersive {
+    padding: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    display: block;
+  }
+  body.mode-immersive header,
+  body.mode-immersive main,
+  body.mode-immersive #docInfo { display: none; }
+  body.mode-immersive #immersiveViewer { display: block; }
+  #immersiveSpacer {
+    width: 100%;
+    position: relative;
+    /* height 由 JS 动态设为 scale × baseH，让 body scrollHeight 跟随 */
+    touch-action: pan-y;  /* 允许垂直 body 原生滚动；pinch/水平 pan 由 JS 接管 */
+    cursor: grab;
+  }
+  #immersiveImg {
+    width: 100%;
+    position: absolute; top: 0; left: 0;
+    display: block;
+    transform-origin: 0 0;
+    will-change: transform;
+    -webkit-user-drag: none; pointer-events: none;
+    /* pan-y：允许垂直 body 原生滚动（图片到物理屏底），禁止 pinch zoom + 水平 pan（JS 接管） */
+    touch-action: pan-y;
+  }
+</style>
+</head>
+<body class="mode-normal">
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>Sketch LAN Mirror</h1>
+  <span id="statusText">连接中…</span>
+</header>
+<main>
+  <div id="stage">
+    <div id="placeholder">等待第一帧…<br>在 Mac 端向 /frame 推送 PNG</div>
+    <div id="canvas"><img id="normalImg" alt="Artboard preview" draggable="false"></div>
+  </div>
+</main>
+<footer id="docInfo">
+  <div class="row1"><em>Artboard</em><b id="mName">—</b></div>
+  <div class="row2"><em>尺寸</em><b id="mSize">—</b><span class="sep">·</span><em>更新时间</em><b id="mTime">—</b></div>
+</footer>
+<div id="immersiveViewer">
+  <div id="immersiveSpacer">
+    <img id="immersiveImg" alt="Artboard 沉浸预览" draggable="false">
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict'
+
+  // ══════════════════════════════════════════════════════
+  // 1. State（统一状态机）
+  // ══════════════════════════════════════════════════════
+  var state = {
+    connection: 'connecting',  // 'connecting' | 'online' | 'offline'
+    image: {
+      hasFrame: false,
+      dims: { w: 0, h: 0 },   // 设计像素（metadata 或 PNG IHDR）
+      name: null,              // 最近画板名
+      lastName: null,         // 上一帧画板名（切换判定）
+      objectUrl: null,         // 当前 Blob URL
+    },
+    viewerMode: 'NORMAL',      // 'NORMAL' | 'IMMERSIVE'
+  }
+
+  // Normal viewer zoom（固定视口 + transform scale）
+  var normalZoom = { scale: 1, tx: 0, ty: 0 }
+  // Immersive zoom（流布局 + spacer height + transform）
+  var imZoom = { scale: 1, offsetX: 0, offsetY: 0 }
+
+  var MAX_SCALE = 5
+  var EDGE_OVERSCROLL = 48
+
+  // PWA standalone 检测
+  var isStandalone =
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) ||
+    window.navigator.standalone === true
+
+  // PWA 底部条带检测：standalone 且布局视口比物理屏矮超过 15px（≈底部系统条带）时
+  // 判定视口未含 home indicator 区 → pwa-strip（贴视口底）；视口已重算为全屏时
+  // → pwa-tight（贴 home indicator 安全区上沿）。
+  // 注意：CSS display-mode 媒体查询在 iOS PWA 谎报 browser，必须用 JS (navigator.standalone) 门控
+  function syncStandaloneBottom() {
+    if (!isStandalone) {
+      document.body.classList.remove('pwa-strip', 'pwa-tight')
+      return
+    }
+    var gap = Math.round(window.screen.height - window.innerHeight)
+    document.body.classList.toggle('pwa-strip', gap > 15)
+    document.body.classList.toggle('pwa-tight', gap <= 15)
+  }
+
+  // PWA 启动视口重算：首帧视口被 iOS 砍短（gap>15）时，临时让 body 溢出 2px
+  // 触发 iOS 把视口重算为全屏（与 immersive 可滚动 body 触发重算同机制），
+  // 期间 opacity:0 隐藏内容避免重算位移可见；1s 内未成功则放弃，回退 pwa-strip。
+  function bootViewportRecalc() {
+    if (!isStandalone) return
+    if (Math.round(window.screen.height - window.innerHeight) <= 15) return
+    document.body.classList.add('pwa-boot')
+    var tries = 0
+    var timer = setInterval(function () {
+      tries++
+      var gap = Math.round(window.screen.height - window.innerHeight)
+      if (gap <= 15 || tries > 20) {
+        clearInterval(timer)
+        document.body.classList.remove('pwa-boot')
+        syncStandaloneBottom()
+      }
+    }, 50)
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 2. DOM refs
+  // ══════════════════════════════════════════════════════
+  var dot = document.getElementById('dot')
+  var statusText = document.getElementById('statusText')
+  var stage = document.getElementById('stage')
+  var canvas = document.getElementById('canvas')
+  var normalImg = document.getElementById('normalImg')
+  var placeholder = document.getElementById('placeholder')
+  var mName = document.getElementById('mName')
+  var mSize = document.getElementById('mSize')
+  var mTime = document.getElementById('mTime')
+  var immersiveViewer = document.getElementById('immersiveViewer')
+  var immersiveSpacer = document.getElementById('immersiveSpacer')
+  var immersiveImg = document.getElementById('immersiveImg')
+
+  // ══════════════════════════════════════════════════════
+  // 3. Normal Viewer（固定视口 + fit + pinch + pan）
+  // ══════════════════════════════════════════════════════
+  function stageSize() { return { w: stage.clientWidth, h: stage.clientHeight } }
+
+  function normalFitScale() {
+    var sz = stageSize()
+    var d = state.image.dims
+    if (!d.w || !d.h || !sz.w || !sz.h) return 1
+    return Math.min(sz.w / d.w, sz.h / d.h)
+  }
+
+  function clampScale(s) {
+    var lo = Math.min(normalFitScale(), 1)
+    return Math.min(Math.max(s, lo), MAX_SCALE)
+  }
+
+  function clampTranslate() {
+    var sz = stageSize()
+    var d = state.image.dims
+    if (!sz.w || !sz.h || !d.w) return
+    var cw = normalZoom.scale * d.w
+    var ch = normalZoom.scale * d.h
+    var OV = EDGE_OVERSCROLL
+    if (cw <= sz.w) normalZoom.tx = (sz.w - cw) / 2
+    else normalZoom.tx = Math.min(Math.max(normalZoom.tx, sz.w - cw - OV), OV)
+    if (ch <= sz.h) normalZoom.ty = (sz.h - ch) / 2
+    else normalZoom.ty = Math.min(Math.max(normalZoom.ty, sz.h - ch - OV), OV)
+  }
+
+  function renderNormal() {
+    clampTranslate()
+    canvas.style.transform =
+      'translate3d(' + normalZoom.tx + 'px,' + normalZoom.ty + 'px,0) scale(' + normalZoom.scale + ')'
+  }
+
+  function normalCenter() {
+    var sz = stageSize()
+    var d = state.image.dims
+    normalZoom.tx = (sz.w - normalZoom.scale * d.w) / 2
+    normalZoom.ty = (sz.h - normalZoom.scale * d.h) / 2
+  }
+
+  function normalFit() {
+    normalZoom.scale = normalFitScale()
+    normalCenter()
+    renderNormal()
+  }
+
+  function normalZoomAt(ns, mx, my) {
+    ns = clampScale(ns)
+    if (ns === normalZoom.scale) { renderNormal(); return }
+    normalZoom.tx = mx - (mx - normalZoom.tx) * ns / normalZoom.scale
+    normalZoom.ty = my - (my - normalZoom.ty) * ns / normalZoom.scale
+    normalZoom.scale = ns
+    renderNormal()
+  }
+
+  // Normal 手势（Pointer Events + touch-action:none）
+  var nPtrs = new Map()
+  var nPinchPrev = null
+  var nTap = null
+  var nDragDist = 0
+
+  function nLocalXY(e) {
+    var r = stage.getBoundingClientRect()
+    return { x: e.clientX - r.left, y: e.clientY - r.top }
+  }
+  function nPtrArr() { var a = []; nPtrs.forEach(function (p) { a.push(p) }); return a }
+
+  stage.addEventListener('pointerdown', function (e) {
+    if (!state.image.hasFrame) return
+    stage.setPointerCapture(e.pointerId)
+    nPtrs.set(e.pointerId, nLocalXY(e))
+    if (nPtrs.size === 1) nDragDist = 0
+    if (nPtrs.size === 2) {
+      var pts = nPtrArr()
+      nPinchPrev = {
+        d: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
+        mx: (pts[0].x + pts[1].x) / 2, my: (pts[0].y + pts[1].y) / 2,
+      }
+      nTap = null
+    }
+    e.preventDefault()
+  })
+  stage.addEventListener('pointermove', function (e) {
+    var prev = nPtrs.get(e.pointerId)
+    if (!prev) return
+    var cur = nLocalXY(e)
+    nPtrs.set(e.pointerId, cur)
+    if (nPtrs.size === 2 && nPinchPrev) {
+      var pts = nPtrArr()
+      var d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)
+      var mx = (pts[0].x + pts[1].x) / 2, my = (pts[0].y + pts[1].y) / 2
+      if (nPinchPrev.d > 0) normalZoomAt(normalZoom.scale * d / nPinchPrev.d, mx, my)
+      nPinchPrev = { d: d, mx: mx, my: my }
+    } else if (nPtrs.size === 1) {
+      nDragDist += Math.hypot(cur.x - prev.x, cur.y - prev.y)
+      normalZoom.tx += cur.x - prev.x
+      normalZoom.ty += cur.y - prev.y
+      renderNormal()
+    }
+  })
+  function nOnUp(e) {
+    var wasSingle = nPtrs.size === 1
+    var p = nLocalXY(e)
+    nPtrs.delete(e.pointerId)
+    if (nPtrs.size < 2) nPinchPrev = null
+    // 双击图片 → 进入 Immersive
+    if (wasSingle && nDragDist < 10) {
+      var now = Date.now()
+      if (nTap && now - nTap.t < 350 &&
+          Math.abs(p.x - nTap.x) < 30 && Math.abs(p.y - nTap.y) < 30) {
+        enterImmersive()
+        nTap = null
+      } else {
+        nTap = { t: now, x: p.x, y: p.y }
+      }
+    }
+  }
+  stage.addEventListener('pointerup', nOnUp)
+  stage.addEventListener('pointercancel', function (e) {
+    nPtrs.delete(e.pointerId)
+    if (nPtrs.size < 2) nPinchPrev = null
+  })
+
+  // ══════════════════════════════════════════════════════
+  // 4. Immersive Viewer（流布局：body 可滚动 + spacer height + transform）
+  // ══════════════════════════════════════════════════════
+  function imBaseH() {
+    var d = state.image.dims
+    var vw = window.innerWidth
+    if (!d.w || !d.h || !vw) return 0
+    return vw * (d.h / d.w)  // width-fit 高度
+  }
+  function imFitScale() { return 1 }  // immersive 默认 width-fit = scale 1
+  function imClampScale(s) {
+    return Math.min(Math.max(s, 1), MAX_SCALE)
+  }
+  function imClampOffset() {
+    var vw = window.innerWidth
+    if (!vw) return
+    var visW = imZoom.scale * vw  // 图片视觉宽度
+    if (visW <= vw) imZoom.offsetX = (vw - visW) / 2  // 居中
+    else imZoom.offsetX = Math.min(Math.max(imZoom.offsetX, vw - visW), 0)
+    // 垂直方向靠 body 原生滚动，offsetY 始终 0
+    imZoom.offsetY = 0
+  }
+  function renderImmersive(skipClamp) {
+    var baseH = imBaseH()
+    if (!baseH) return
+    if (!skipClamp) imClampOffset()
+    // spacer height = scale × baseH，让 body scrollHeight 跟随 scale
+    immersiveSpacer.style.height = (imZoom.scale * baseH) + 'px'
+    immersiveImg.style.transform =
+      'translate3d(' + imZoom.offsetX + 'px,' + imZoom.offsetY + 'px,0) scale(' + imZoom.scale + ')'
+  }
+
+  function resetImZoom() {
+    imZoom.scale = 1
+    imZoom.offsetX = 0
+    imZoom.offsetY = 0
+    if (state.viewerMode === 'IMMERSIVE') window.scrollTo(0, 0)
+    renderImmersive()
+  }
+
+  function enterImmersive() {
+    if (!state.image.hasFrame) return
+    state.viewerMode = 'IMMERSIVE'
+    // classList 增删而非覆写 className：保留 body.pwa-strip 等 JS 检测类，
+    // 覆写会把它抹掉 → 退出后底部 padding 回退 → 黑底变大
+    document.body.classList.remove('mode-normal')
+    document.body.classList.add('mode-immersive')
+    immersiveImg.src = state.image.objectUrl
+    resetImZoom()  // width-fit + 不记忆上次 zoom
+    nTap = null; imTap = null  // 清空 tap 基线
+  }
+  function exitImmersive() {
+    state.viewerMode = 'NORMAL'
+    document.body.classList.remove('mode-immersive')
+    document.body.classList.add('mode-normal')
+    syncStandaloneBottom()
+    // 不保存 zoom state
+    nTap = null; imTap = null
+  }
+
+  // Immersive 手势（Pointer Events on immersiveImg + touch-action:none）
+  var imPtrs = new Map()
+  var imPinchPrev = null
+  var imTap = null
+  var imDragDist = 0
+
+  function imLocalXY(e) {
+    var r = immersiveSpacer.getBoundingClientRect()
+    return { x: e.clientX - r.left, y: e.clientY - r.top }
+  }
+  function imPtrArr() { var a = []; imPtrs.forEach(function (p) { a.push(p) }); return a }
+
+  // pinch 锚点：lx/ly 是相对 spacer 的坐标（localXY），即未缩放图片上的坐标。
+  // 水平方向通过 offsetX 保持锚点；垂直方向在 pinch 过程中也通过 transform offsetY 保持锚点，
+  // 与 normal 模式的 normalZoomAt 完全同构：ax=(lx-offsetX)/scale, ay=(ly-offsetY)/scale，
+  // 避免高频 scrollTo 与 transform 不同步导致的闪动。pinch 结束后再把 offsetY 折算成 scrollY 提交。
+  function imZoomAt(ns, lx, ly) {
+    ns = imClampScale(ns)
+    if (ns === imZoom.scale) { renderImmersive(true); return }
+    var ax = (lx - imZoom.offsetX) / imZoom.scale
+    var ay = (ly - imZoom.offsetY) / imZoom.scale
+    imZoom.offsetX = lx - ax * ns
+    imZoom.offsetY = ly - ay * ns
+    imZoom.scale = ns
+    renderImmersive(true)  // pinch 中不 clamp offsetY，让锚点生效
+  }
+
+  // pinch 结束后，把 transform 的 offsetY 折算成 body scrollY 提交，再清零 offsetY。
+  //
+  // 坐标推导：transform = translate3d(offsetX,offsetY,0) scale(scale)，先 scale 后 translate，
+  // 图像局部点 (x,y) 映射到 spacer 坐标 = (offsetX + scale*x, offsetY + scale*y)。
+  // 设 pinch 焦点局部 y = ay，其 spacer 坐标 = offsetY + scale*ay；在视口里出现于
+  // viewportY = (offsetY + scale*ay) − scrollY。松手后令 offsetY=0，要保持同一焦点不动，
+  // 须满足 scale*ay − scrollY' = offsetY + scale*ay − scrollY  ⇒  scrollY' = scrollY − offsetY。
+  // 即视觉位移 = −offsetY（offsetY 已经是屏幕 px，不要再乘 scale，旧代码 ×scale 导致被 clamp 到 0 → 跳顶）。
+  // 为顺滑改用 rAF 动画过渡，动画期间焦点始终钉在原位。
+  function commitImZoomOffsetY() {
+    if (imZoom.offsetY === 0) return
+    var scrollY = window.scrollY || window.pageYOffset
+    var visualShift = -imZoom.offsetY
+    var maxScroll = Math.max(0, imZoom.scale * imBaseH() - window.innerHeight)
+    var targetScrollY = Math.max(0, Math.min(scrollY + visualShift, maxScroll))
+    var startOffsetY = imZoom.offsetY
+    var startScrollY = scrollY
+    var startTime = performance.now()
+    var duration = 120  // ms，短促顺滑
+    function step(now) {
+      var t = Math.min(1, (now - startTime) / duration)
+      // easeOutCubic
+      var p = 1 - Math.pow(1 - t, 3)
+      imZoom.offsetY = startOffsetY * (1 - p)
+      window.scrollTo(0, startScrollY + (targetScrollY - startScrollY) * p)
+      renderImmersive(true)
+      if (t < 1) requestAnimationFrame(step)
+      else {
+        imZoom.offsetY = 0
+        renderImmersive()
+      }
+    }
+    requestAnimationFrame(step)
+  }
+
+  // 事件绑定到 immersiveSpacer（gesture surface），而不是 img。
+  // img 保持 pointer-events:none 避免与 transform 产生不可控命中，同时让 spacer 统一接管。
+  immersiveSpacer.addEventListener('pointerdown', function (e) {
+    imPtrs.set(e.pointerId, imLocalXY(e))
+    if (imPtrs.size === 1) imDragDist = 0
+    if (imPtrs.size === 2) {
+      var pts = imPtrArr()
+      imPinchPrev = {
+        d: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
+        mx: (pts[0].x + pts[1].x) / 2, my: (pts[0].y + pts[1].y) / 2,
+      }
+      imTap = null
+    }
+    // 不 preventDefault、不 setPointerCapture：保留 body 原生垂直滚动（touch-action: pan-y）。
+    // 双指 pinch 在 pointermove 中再 preventDefault，避免原生滚动/缩放干扰焦点计算。
+  })
+  immersiveSpacer.addEventListener('pointermove', function (e) {
+    var prev = imPtrs.get(e.pointerId)
+    if (!prev) return
+    var cur = imLocalXY(e)
+    imPtrs.set(e.pointerId, cur)
+    if (imPtrs.size === 2 && imPinchPrev) {
+      e.preventDefault()  // 双指 pinch：阻止原生垂直滚动/缩放，完全由 JS 接管焦点
+      var pts = imPtrArr()
+      var d = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)
+      var mx = (pts[0].x + pts[1].x) / 2, my = (pts[0].y + pts[1].y) / 2
+      // mx/my 已是 localXY（相对 spacer），直接传给 imZoomAt
+      if (imPinchPrev.d > 0) imZoomAt(imZoom.scale * d / imPinchPrev.d, mx, my)
+      imPinchPrev = { d: d, mx: mx, my: my }
+    } else if (imPtrs.size === 1 && imZoom.scale > 1) {
+      // scale>1 时单指水平 pan（垂直靠 body 原生滚动，不处理）
+      imDragDist += Math.hypot(cur.x - prev.x, cur.y - prev.y)
+      imZoom.offsetX += cur.x - prev.x
+      renderImmersive()
+    }
+  })
+  function imOnUp(e) {
+    var wasSingle = imPtrs.size === 1
+    var p = imLocalXY(e)
+    var wasPinchEnd = imPtrs.size === 2
+    imPtrs.delete(e.pointerId)
+    if (imPtrs.size < 2) {
+      // 双指之一松开：把 pinch 中积累的垂直 anchor 偏移提交给 body scroll
+      if (wasPinchEnd) commitImZoomOffsetY()
+      imPinchPrev = null
+    }
+    // 双击退出 Immersive
+    if (wasSingle && imDragDist < 10) {
+      var now = Date.now()
+      if (imTap && now - imTap.t < 350 &&
+          Math.hypot(p.x - imTap.x, p.y - imTap.y) < 30) {
+        exitImmersive()
+        imTap = null
+      } else {
+        imTap = { t: now, x: p.x, y: p.y }
+      }
+    }
+  }
+  immersiveSpacer.addEventListener('pointerup', imOnUp)
+  immersiveSpacer.addEventListener('pointercancel', function (e) {
+    imPtrs.delete(e.pointerId)
+    if (imPtrs.size < 2) imPinchPrev = null
+  })
+
+  // 屏蔽 iOS 页面级缩放（不影响 button click）
+  ;['gesturestart', 'gesturechange', 'gestureend'].forEach(function (ev) {
+    document.addEventListener(ev, function (e) { e.preventDefault() })
+  })
+  document.addEventListener('dblclick', function (e) { e.preventDefault() })
+
+  // ══════════════════════════════════════════════════════
+  // 5. 横竖屏 / viewport change
+  // ══════════════════════════════════════════════════════
+  function onViewportChange() {
+    syncStandaloneBottom()
+    if (state.viewerMode === 'IMMERSIVE') {
+      // immersive：保持当前 scale，重新约束 offset + 重算 spacer height
+      renderImmersive()
+      return
+    }
+    if (!state.image.hasFrame) return
+    // normal：fit 重算居中
+    normalFit()
+  }
+  window.addEventListener('resize', onViewportChange)
+  window.addEventListener('orientationchange', function () { setTimeout(onViewportChange, 250) })
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', onViewportChange)
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 6. Frame processing（WS 二进制 + 补帧 + 画板切换判定）
+  // ══════════════════════════════════════════════════════
+  function processFrame(blob, name, w, h) {
+    var switched = false
+    if (!state.image.hasFrame) {
+      switched = true
+    } else {
+      if (w !== state.image.dims.w || h !== state.image.dims.h) switched = true
+      if (name !== null && state.image.lastName !== null && name !== state.image.lastName) switched = true
+    }
+
+    // 新 Blob URL，回收旧 URL（防泄漏）
+    if (state.image.objectUrl) URL.revokeObjectURL(state.image.objectUrl)
+    state.image.objectUrl = URL.createObjectURL(blob)
+    normalImg.src = state.image.objectUrl
+
+    if (switched) {
+      state.image.dims = { w: w, h: h }
+      normalImg.style.width = w + 'px'
+      normalImg.style.height = h + 'px'
+      // 画板切换：immersive 退出回 normal；normal 重新 fit
+      if (state.viewerMode === 'IMMERSIVE') {
+        exitImmersive()
+        normalFit()
+      } else {
+        normalFit()
+      }
+    }
+    // 同画板内容更新：保留当前 viewer state（不跳）
+    if (name !== null) state.image.lastName = name
+    state.image.hasFrame = true
+    normalImg.style.display = 'block'
+    placeholder.style.display = 'none'
+    // immersive 模式同步最新帧
+    if (state.viewerMode === 'IMMERSIVE') immersiveImg.src = state.image.objectUrl
+    if (state.viewerMode === 'NORMAL') renderNormal()
+  }
+
+  // 无 meta 时从 PNG IHDR 解析尺寸（重连补帧 /current 只有二进制）
+  function blobHead(blob, bytes) {
+    if (blob.arrayBuffer) return blob.slice(0, bytes).arrayBuffer()
+    return new Promise(function (resolve, reject) {
+      var fr = new FileReader()
+      fr.onload = function () { resolve(fr.result) }
+      fr.onerror = reject
+      fr.readAsArrayBuffer(blob.slice(0, bytes))
+    })
+  }
+  function showFrame(blob, meta) {
+    if (meta && meta.width && meta.height) {
+      processFrame(blob, meta.name || null, Number(meta.width), Number(meta.height))
+    } else {
+      blobHead(blob, 24).then(function (buf) {
+        var dv = new DataView(buf)
+        var w = dv.getUint32(16)
+        var h = dv.getUint32(20)
+        if (w > 0 && h > 0) processFrame(blob, null, w, h)
+      }).catch(function () {})
+    }
+  }
+
+  function applyMeta(meta) {
+    if (!meta) return
+    mName.textContent = meta.name || '—'
+    mSize.textContent = meta.width && meta.height ? meta.width + ' × ' + meta.height : '—'
+    if (meta.ts) {
+      var d = new Date(meta.ts)
+      var pad = function (n) { return (n < 10 ? '0' : '') + n }
+      mTime.textContent = pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds())
+    }
+  }
+
+  // ══════════════════════════════════════════════════════
+  // 7. Connection（WS + 指数退避重连 + 回前台补帧）
+  // ══════════════════════════════════════════════════════
+  var ws = null
+  var retryDelay = 1000
+  var reconnectTimer = null
+  var pendingMeta = null
+
+  function setStatus(s) {
+    dot.className = 'dot ' + s
+    if (s === 'online') statusText.textContent = '已连接'
+    else if (s === 'connecting') statusText.textContent = '连接中…'
+    else statusText.textContent = '已断开，自动重连中'
+    state.connection = s
+  }
+
+  function catchUp() {
+    fetch('/current', { cache: 'no-store' })
+      .then(function (res) { return res.ok ? res.blob() : null })
+      .then(function (blob) { if (blob) showFrame(blob, null) })
+      .catch(function () {})
+  }
+
+  function scheduleReconnect() {
+    clearTimeout(reconnectTimer)
+    reconnectTimer = setTimeout(connect, retryDelay)
+    retryDelay = Math.min(retryDelay * 2, 15000)
+  }
+
+  function connect() {
+    clearTimeout(reconnectTimer)
+    setStatus('connecting')
+    try {
+      var proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      ws = new WebSocket(proto + '//' + location.host + '/')
+    } catch (e) { scheduleReconnect(); return }
+    ws.binaryType = 'blob'
+    ws.onopen = function () { retryDelay = 1000; setStatus('online'); catchUp() }
+    ws.onmessage = function (event) {
+      if (typeof event.data === 'string') {
+        try { pendingMeta = JSON.parse(event.data); applyMeta(pendingMeta) } catch (e) {}
+      } else {
+        var meta = pendingMeta
+        pendingMeta = null
+        showFrame(event.data, meta)
+      }
+    }
+    ws.onclose = function () { setStatus('offline'); scheduleReconnect() }
+    ws.onerror = function () { if (ws) ws.close() }
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible') return
+    syncStandaloneBottom()
+    if (!ws || ws.readyState > 1) connect()
+    else catchUp()
+  })
+
+  // ══════════════════════════════════════════════════════
+  // 8. Init
+  // ══════════════════════════════════════════════════════
+  syncStandaloneBottom()
+  // 启动视口重算（PWA 首帧视口砍短时把视口撑到全屏，黑底从 ~62px 降到安全区上沿）
+  bootViewportRecalc()
+  // 视口可能在无 resize 事件的情况下变化（iOS 静默回收/恢复），低频轮询兜底
+  setInterval(syncStandaloneBottom, 1000)
+  // PWA 冷启动时视口可能晚定格（加载后高度才稳定，且不一定触发 resize），
+  // 延迟复检兜底，避免 pwa-strip 误留在错误状态
+  setTimeout(syncStandaloneBottom, 300)
+  setTimeout(syncStandaloneBottom, 1000)
+  connect()
+})()
+</script>
+</body>
+</html>

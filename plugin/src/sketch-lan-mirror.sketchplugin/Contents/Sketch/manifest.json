@@ -1,0 +1,32 @@
+{
+  "compatibleVersion": 3,
+  "bundleVersion": 5,
+  "name": "Sketch LAN Mirror",
+  "identifier": "com.xuezx.sketch-lan-mirror",
+  "version": "0.3.2",
+  "author": "Zhixiang Xue",
+  "commands": [
+    {
+      "script": "script.cocoascript",
+      "name": "Send Current Frame",
+      "identifier": "send-current-frame",
+      "handler": "onRun"
+    },
+    {
+      "script": "script.cocoascript",
+      "name": "Start Mirror",
+      "identifier": "start-mirror",
+      "handler": "onStartMirror"
+    },
+    {
+      "script": "script.cocoascript",
+      "name": "Stop Mirror",
+      "identifier": "stop-mirror",
+      "handler": "onStopMirror"
+    }
+  ],
+  "menu": {
+    "title": "Sketch LAN Mirror",
+    "items": ["send-current-frame", "start-mirror", "stop-mirror"]
+  }
+}

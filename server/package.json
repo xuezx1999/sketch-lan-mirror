@@ -1,0 +1,13 @@
+{
+  "name": "sketch-lan-mirror-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sketch LAN Mirror - M1 standalone LAN server (HTTP + WebSocket)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

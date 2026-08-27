@@ -1,0 +1,542 @@
+/* Sketch LAN Mirror — M3-A Live Mirror
+ *
+ * 菜单：
+ *   Send Current Frame  单帧发送（M2 行为，保持不变）
+ *   Start Mirror        启动 1s 轮询（setInterval；运行时原生提供，
+ *                       NSTimer 的 target/block/delegate 在本环境均不可用，见 DECISIONS ADR-008）
+ *   Stop Mirror         停止轮询
+ *
+ * 策略（刻意最简）：
+ *   - 每 1s 全量导出当前选中 Artboard 并 POST，不做 hash/diff/事件监听/防抖
+ *   - 目标解析：选中画板本身或其内部任意图层均可，parent 链向上归属（ADR-012）
+ *   - 导出前做渲染缓存刷新（定时器回调里的 export 可能拿到陈旧渲染，见 ADR-010）
+ *   - 删除检测：被删画板触发的自动跳选不推帧，保持手机最后一帧（ADR-011）
+ *   - latest-frame-only：上一帧未发完（sending=true）则本轮直接跳过，不排队
+ *   - 不缓存 Artboard 对象：每 tick 从 document/page/selection 重新解析，只记 id
+ */
+
+var SERVER_HOST = '127.0.0.1'
+var SERVER_PORT = 9777
+var MIRROR_INTERVAL_SEC = 1.0
+
+// ── 插件级持久状态（同一插件上下文内跨命令共享）───────────────
+var SLM = {
+  running: false,
+  timerId: null,
+  currentArtboardId: null,
+  currentPageId: null,         // 跨 Page 检测（M3-C 修复：跨 Page 不应被误判为删除）
+  suppressedArtboardId: null, // 删除检测：被抑制的自动跳选 Artboard id（ADR-011）
+  sending: false,
+  lastSendTs: null,
+  lastExportMs: null,
+  lastPostMs: null,
+}
+
+// ── 命令入口 ──────────────────────────────────────────────
+function onRun(context) {
+  var r = sendCurrentFrameCore()
+  if (r.ok) {
+    notifyUser('Sent: ' + r.artboard,
+      'PNG ' + formatKB(r.bytes) + ' · export ' + r.exportMs + 'ms · post ' + r.postMs + 'ms · 总耗时 ' + r.totalMs + 'ms')
+  } else {
+    notifyError(r.error)
+  }
+}
+
+function onStartMirror(context) {
+  if (SLM.running) {
+    notifyInfo('Mirror already running')
+    return
+  }
+
+  // 与单帧发送相同的启动校验：文档 → 页面 → 选中的 Artboard
+  var target = resolveTargetArtboard()
+  if (!target.ok) {
+    notifyError(target.error)
+    return
+  }
+
+  // 立即发送第一帧（失败则不启动轮询，让用户看到具体错误）
+  var first = sendCurrentFrameCore()
+  if (!first.ok) {
+    notifyError(first.error)
+    return
+  }
+  SLM.currentArtboardId = first.artboardId
+  SLM.currentPageId = first.pageId
+
+  SLM.timerId = setInterval(mirrorTick, MIRROR_INTERVAL_SEC * 1000)
+  SLM.running = true
+  SLM.suppressedArtboardId = null
+  log('[LAN Mirror] started, interval=' + MIRROR_INTERVAL_SEC + 's')
+  notifyInfo('Mirror started\n' + 'http://' + SERVER_HOST + ':' + SERVER_PORT + '\n每 ' + MIRROR_INTERVAL_SEC + 's 自动推送选中 Artboard')
+}
+
+function onStopMirror(context) {
+  if (!SLM.running) {
+    notifyInfo('Mirror is not running')
+    return
+  }
+  clearInterval(SLM.timerId)
+  SLM.timerId = null
+  SLM.running = false
+  SLM.suppressedArtboardId = null
+  SLM.currentPageId = null
+  log('[LAN Mirror] stopped')
+  notifyInfo('Mirror stopped')
+}
+
+// ── 每 tick：重新解析目标 → 发帧（latest-frame-only）──────────
+function mirrorTick() {
+  if (SLM.sending) {
+    // 上一帧仍在 export/POST：跳过本轮，绝不排队、绝不并发
+    log('[LAN Mirror] tick skipped (previous frame in flight)')
+    return
+  }
+  SLM.sending = true
+  try {
+    var target = resolveTargetArtboard()
+    if (!target.ok) {
+      // 没有文档 / 没有选中 Artboard / Artboard 被删：保留手机最后一帧，只记日志
+      log('[LAN Mirror] No selected Artboard (' + target.error.replace(/\n/g, ' ') + ')')
+      return
+    }
+
+    // ── 跨 Page 检测（M3-C 修复：跨 Page 被误判为删除）──────────
+    // 仅当旧画板仍在「当前 Page」上时，下面的删除抑制逻辑才有意义；
+    // 一旦 Page 变了，说明用户在 Sketch 中切到了另一个 Page，必须正常推送新 Page 的当前画板，
+    // 否则会被 artboardExistsOnPage 判为「已删除」而错误抑制推帧。
+    if (SLM.currentPageId !== null && target.pageId !== SLM.currentPageId) {
+      log('[LAN Mirror] page switched -> "' + target.page.name + '"; resetting tracker, sending immediately')
+      SLM.currentPageId = target.pageId
+      SLM.currentArtboardId = null
+      SLM.suppressedArtboardId = null
+    }
+
+    // ── 删除检测（ADR-011）────────────────────────────────
+    // 上一次推送的 Artboard 已从页面消失 → 本次选区是 Sketch 删除后的「自动跳选」，
+    // 抑制该帧不推送，保持手机最后一帧；用户后续手动选中另一个不同 id 的 Artboard 才恢复。
+    if (SLM.currentArtboardId !== null && target.artboardId !== SLM.currentArtboardId) {
+      if (SLM.suppressedArtboardId !== null && target.artboardId === SLM.suppressedArtboardId) {
+        // 仍在被抑制的自动跳选上：继续跳过
+        return
+      }
+      if (!artboardExistsOnPage(target.page, SLM.currentArtboardId)) {
+        SLM.suppressedArtboardId = target.artboardId
+        log('[LAN Mirror] previous artboard deleted; keeping last phone frame (suppressed "' + target.name + '")')
+        return
+      }
+    } else if (target.artboardId === SLM.currentArtboardId && SLM.suppressedArtboardId !== null) {
+      // 回到被跟踪的画板：解除抑制
+      SLM.suppressedArtboardId = null
+    }
+
+    var switched = SLM.currentArtboardId !== null && SLM.currentArtboardId !== target.artboard.id
+    if (switched) {
+      log('[LAN Mirror] artboard switched -> "' + target.artboard.name + '", sending immediately')
+    }
+
+    // 定时器回调里的 export 会拿到陈旧渲染缓存（ADR-010），先做无损刷新
+    forceRenderFlush()
+
+    var r = exportAndPost(target.artboard)
+    if (r.ok) {
+      SLM.currentArtboardId = r.artboardId
+      SLM.currentPageId = target.pageId
+      SLM.lastSendTs = Date.now()
+      SLM.lastExportMs = r.exportMs
+      SLM.lastPostMs = r.postMs
+      log('[LAN Mirror] frame "' + r.artboard + '" ' + formatKB(r.bytes) +
+          ' export=' + r.exportMs + 'ms post=' + r.postMs + 'ms total=' + r.totalMs +
+          (switched ? ' [switched]' : ''))
+    } else {
+      // 单帧失败不中断镜像（如 server 重启中），下个 tick 自然重试
+      log('[LAN Mirror] tick send failed: ' + r.error.replace(/\n/g, ' '))
+    }
+  } catch (err) {
+    log('[LAN Mirror] tick error: ' + err)
+  } finally {
+    SLM.sending = false
+  }
+}
+
+// ── 核心流程：解析选区（每次全新获取，不缓存对象）─────────────
+// 目标规则（v0.3.2）：选中 Artboard 本身 或 其内部任意图层/组均可——
+// 沿 parent 链向上找到所属 Artboard 即作为推送目标（ADR-012）。
+// 多个 Artboard 同时被命中时，优先保持上一次推送的那一个（稳定性）。
+function resolveTargetArtboard() {
+  var dom = require('sketch/dom')
+  var sketch = require('sketch')
+
+  var document = dom.getSelectedDocument()
+  if (!document) {
+    return { ok: false, error: '没有已打开的文档。请先打开一个文档并选中一个 Artboard。' }
+  }
+
+  var page = document.selectedPage
+  if (!page) {
+    return { ok: false, error: '当前文档没有选中的 Page。' }
+  }
+
+  var layers = []
+  try {
+    layers = page.selectedLayers.layers || []
+  } catch (e) {
+    layers = []
+  }
+
+  var seen = {}
+  var candidates = []
+  for (var i = 0; i < layers.length; i++) {
+    var ab = findAncestorArtboard(layers[i], sketch)
+    if (ab && !seen[ab.id]) {
+      seen[ab.id] = true
+      candidates.push(ab)
+    }
+  }
+
+  if (!candidates.length) {
+    return { ok: false, error: '当前选区不在任何 Artboard 内。\n请选中某个 Artboard 自身或其内部的任意图层。' }
+  }
+
+  var chosen = candidates[0]
+  if (SLM.currentArtboardId !== null) {
+    for (var j = 0; j < candidates.length; j++) {
+      if (String(candidates[j].id) === String(SLM.currentArtboardId)) {
+        chosen = candidates[j]
+        break
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    artboard: chosen,
+    artboardId: String(chosen.id),
+    pageId: String(page.id),
+    name: String(chosen.name),
+    width: Math.round(chosen.frame.width),
+    height: Math.round(chosen.frame.height),
+    page: page,
+  }
+}
+
+// 沿 parent 链向上查找所属 Artboard（2025.1+ 用 legacy 类型标记 'Artboard' 判定，
+// 与顶层直接选中同一判定标准；Symbol Master 等非页面容器不会被误认）
+function findAncestorArtboard(layer, sketch) {
+  var cur = layer
+  var depth = 0
+  while (cur && depth < 64) {
+    try {
+      if (cur.type === 'Artboard' || cur.type === sketch.Types.Artboard) return cur
+      cur = cur.parent
+    } catch (e) {
+      return null
+    }
+    depth++
+  }
+  return null
+}
+
+// ── 删除检测辅助：id 是否仍存在于当前页面顶层图层 ─────────────
+function artboardExistsOnPage(page, artboardId) {
+  if (!page || artboardId === null) return false
+  try {
+    var layers = page.layers || []
+    for (var i = 0; i < layers.length; i++) {
+      if (String(layers[i].id) === String(artboardId)) return true
+    }
+  } catch (e) {}
+  return false
+}
+
+// ── 渲染缓存刷新（ADR-010）────────────────────────────────
+// 现象：setInterval 回调里直接 sketch.export 得到的是陈旧渲染（字节完全不变），
+// 直到用户再次点击画板才刷新。每 tick 导出前做无损刷新尝试；
+// 所有候选先用 respondsToSelector 探测，避免未知 selector 直接抛 Obj-C 异常。
+var SLM_FLUSH_STATUS = {}
+
+function forceRenderFlush() {
+  var dom = require('sketch/dom')
+  var document = null
+  try { document = dom.getSelectedDocument() } catch (e) { return }
+  if (!document || !document.sketchObject) return
+  var doc = document.sketchObject
+
+  var view = null
+  try { view = doc.currentView() } catch (e) {}
+
+  // 1) 画布视图刷帧：强制重绘当前视图内容
+  tryFlushOnce('view.flushGraphics', view, 'flushGraphics', function () {
+    view.flushGraphics()
+  })
+  // 2) NSView 标脏：请求下一轮重绘（selector 一定存在，最安全）
+  tryFlushOnce('view.setNeedsDisplay', view, 'setNeedsDisplay:', function () {
+    view.setNeedsDisplay(true)
+  })
+  // 3) 文档检查器重载：触发文档数据向 UI 的同步
+  tryFlushOnce('doc.reloadInspector', doc, 'reloadInspector', function () {
+    doc.reloadInspector()
+  })
+}
+
+function responds(obj, selector) {
+  try { return !!obj.respondsToSelector(selector) } catch (e) { return false }
+}
+
+function tryFlushOnce(key, obj, selector, fn) {
+  var probed = SLM_FLUSH_STATUS[key]
+  if (probed === 'unavailable' || probed === 'fail') return // 已确认不可用：后续 tick 不再调用
+  try {
+    if (obj && !responds(obj, selector)) {
+      if (!probed) {
+        SLM_FLUSH_STATUS[key] = 'unavailable'
+        log('[LAN Mirror] flush probe: ' + key + ' unavailable')
+      }
+      return
+    }
+    fn()
+    if (!probed) {
+      SLM_FLUSH_STATUS[key] = 'ok'
+      log('[LAN Mirror] flush probe: ' + key + ' ok')
+    }
+  } catch (e) {
+    if (!probed) {
+      SLM_FLUSH_STATUS[key] = 'fail'
+      log('[LAN Mirror] flush probe: ' + key + ' failed (' + e + ')')
+    }
+  }
+}
+
+// ── 核心流程：export → toNSData → 同步 POST（M2 已验证路径）───
+function exportAndPost(artboard) {
+  var sketch = require('sketch')
+  var startedAt = Date.now()
+
+  var exportStart = Date.now()
+  var results = sketch.export(artboard, { formats: 'png', scales: '1', output: false })
+  var exportMs = Date.now() - exportStart
+
+  if (!results) {
+    return { ok: false, error: 'sketch.export 未返回任何结果' }
+  }
+  // 实测：单图层返回单个 Buffer；数组形态兼容（ADR-001）
+  var pngSource = results
+  if (results.constructor && results.constructor.name === 'Array') {
+    if (!results.length) {
+      return { ok: false, error: 'sketch.export 返回了空数组' }
+    }
+    pngSource = results[0]
+  }
+
+  var magicOk = false
+  try {
+    magicOk = pngSource[0] === 0x89 && pngSource[1] === 0x50 &&
+              pngSource[2] === 0x4e && pngSource[3] === 0x47
+  } catch (e) {}
+  if (!magicOk) {
+    magicOk = hasPngMagic(pngSource)
+  }
+  if (!magicOk) {
+    return { ok: false, error: 'export 结果不是合法 PNG（magic bytes 校验失败）' }
+  }
+
+  var convertStart = Date.now()
+  var pngData = toNSData(pngSource)
+  var convertMs = Date.now() - convertStart
+
+  var postStart = Date.now()
+  var statusCode = postFrame(pngData, String(artboard.name), Math.round(artboard.frame.width), Math.round(artboard.frame.height))
+  var postMs = Date.now() - postStart
+  var totalMs = Date.now() - startedAt
+
+  return {
+    ok: statusCode === 200,
+    error: statusCode === 200 ? null : 'Server 返回 HTTP ' + statusCode,
+    artboard: String(artboard.name),
+    artboardId: String(artboard.id),
+    bytes: Number(pngData.length()),
+    exportMs: exportMs,
+    convertMs: convertMs,
+    postMs: postMs,
+    totalMs: totalMs,
+  }
+}
+
+// Send Current Frame 复用同一条链路
+function sendCurrentFrameCore() {
+  var target = resolveTargetArtboard()
+  if (!target.ok) {
+    return { ok: false, error: target.error }
+  }
+    var r = exportAndPost(target.artboard)
+  r.name = target.name
+  r.width = target.width
+  r.height = target.height
+  r.pageId = target.pageId
+  return r
+}
+
+// ── 网络：同步 POST（ADR-004：异步回调在本环境不可用）─────────
+function postFrame(pngData, artboardName, width, height) {
+  var url = NSURL.URLWithString('http://' + SERVER_HOST + ':' + SERVER_PORT + '/frame')
+  var request = NSMutableURLRequest.requestWithURL(url)
+  request.setHTTPMethod('POST')
+  request.setTimeoutInterval(5)
+
+  request.setValue_forHTTPHeaderField('image/png', 'Content-Type')
+  request.setValue_forHTTPHeaderField(encodeHeader(artboardName), 'x-artboard-name')
+  request.setValue_forHTTPHeaderField(String(width), 'x-width')
+  request.setValue_forHTTPHeaderField(String(height), 'x-height')
+  request.setValue_forHTTPHeaderField(String(Date.now()), 'x-ts')
+  request.setHTTPBody(pngData)
+
+  function newPtr() {
+    try { return MOPointer.alloc().init() } catch (e) { return MOPointer.new() }
+  }
+  var responsePtr = newPtr()
+  var errorPtr = newPtr()
+  var responseData = NSURLConnection.sendSynchronousRequest_returningResponse_error(request, responsePtr, errorPtr)
+
+  var err = errorPtr.value()
+  if (err || !responseData) {
+    throw new Error(
+      '无法连接 http://' + SERVER_HOST + ':' + SERVER_PORT + '\n请先启动服务：node server/index.js\n(' + describeValue(err) + ')'
+    )
+  }
+
+  var response = responsePtr.value()
+  var statusCode = 0
+  try { statusCode = Number(response.statusCode()) } catch (e) {}
+  return statusCode
+}
+
+// ── Buffer → NSData 多策略转换（主路径 toNSData，ADR-002）────
+function toNSData(buf) {
+  if (!buf) throw new Error('export 结果为空')
+
+  if (buf.isKindOfClass && buf.isKindOfClass(NSData)) {
+    __SLM_CONVERT_STRATEGY = 'already-NSData'
+    return buf
+  }
+  if (typeof buf.toNSData === 'function') {
+    __SLM_CONVERT_STRATEGY = 'buffer.toNSData'
+    return buf.toNSData()
+  }
+  if (typeof buf.nsdata === 'function') {
+    __SLM_CONVERT_STRATEGY = 'nsdata-accessor'
+    return buf.nsdata()
+  }
+  var len = safeLength(buf)
+  var rawBytes = null
+  try { rawBytes = typeof buf.bytes === 'function' ? buf.bytes() : buf.bytes } catch (e) {}
+  if (len > 0 && rawBytes) {
+    __SLM_CONVERT_STRATEGY = 'dataWithBytes_length'
+    return NSData.dataWithBytes_length(rawBytes, len)
+  }
+  if (typeof buf.toString === 'function') {
+    __SLM_CONVERT_STRATEGY = 'base64-fallback'
+    var b64 = buf.toString('base64')
+    return NSData.alloc().initWithBase64EncodedString_options(b64, 0)
+  }
+  throw new Error('无法将 export 结果转换为 NSData，实际类型：' + describeValue(buf))
+}
+
+function hasPngMagic(source) {
+  try {
+    var probe = toNSData(source)
+    if (probe.length() < 8) return false
+    var head = probe.subdataWithRange(NSMakeRange(0, 4))
+    return String(head.description()).indexOf('89504e47') !== -1
+  } catch (e) {
+    return false
+  }
+}
+
+// ── 小工具 ────────────────────────────────────────────────
+function safeLength(obj) {
+  try {
+    if (typeof obj.length === 'function') return Number(obj.length())
+    if (obj.length !== undefined) return Number(obj.length)
+  } catch (e) {}
+  try { return Number(obj.length()) } catch (e) { return -1 }
+}
+
+function describeValue(obj) {
+  try {
+    if (obj === null || obj === undefined) return String(obj)
+    var s = Object.prototype.toString.call(obj)
+    if (s.indexOf('Object') !== -1 && obj.constructor && obj.constructor.name) {
+      s += ' / ' + obj.constructor.name
+    }
+    return s
+  } catch (e) {
+    return '(unprintable)'
+  }
+}
+
+function encodeHeader(value) {
+  var encoded = ''
+  for (var i = 0; i < value.length; i++) {
+    var ch = value.charAt(i)
+    var code = value.charCodeAt(i)
+    if (code >= 32 && code <= 126) {
+      encoded += ch
+    } else {
+      encoded += encodeURIComponent(ch)
+    }
+  }
+  return encoded
+}
+
+function formatKB(bytes) {
+  return bytes >= 1024 * 1024
+    ? (bytes / 1024 / 1024).toFixed(1) + ' MB'
+    : Math.round(bytes / 1024) + ' KB'
+}
+
+// ── UI 输出（自动化静默模式走全局变量，正常模式弹窗）─────────
+function silentMode() {
+  try { return typeof __SLM_SILENT !== 'undefined' && !!__SLM_SILENT } catch (e) { return false }
+}
+
+function recordResult(obj) {
+  __SLM_LAST_RESULT = obj
+}
+
+function notifyUser(title, message) {
+  if (silentMode()) {
+    recordResult({ ok: true, title: title, message: message })
+    log('[LAN Mirror] OK: ' + title)
+    return
+  }
+  var alert = NSAlert.alloc().init()
+  alert.setMessageText(title)
+  alert.setInformativeText(message)
+  alert.runModal()
+}
+
+function notifyInfo(message) {
+  if (silentMode()) {
+    recordResult({ ok: true, info: message })
+    log('[LAN Mirror] INFO: ' + message)
+    return
+  }
+  var alert = NSAlert.alloc().init()
+  alert.setMessageText('Sketch LAN Mirror')
+  alert.setInformativeText(message)
+  alert.runModal()
+}
+
+function notifyError(message) {
+  if (silentMode()) {
+    recordResult({ ok: false, error: message })
+    log('[LAN Mirror] FAIL: ' + message)
+    return
+  }
+  var alert = NSAlert.alloc().init()
+  alert.setMessageText('Sketch LAN Mirror')
+  alert.setInformativeText(message)
+  alert.setAlertStyle(1)
+  alert.runModal()
+}
