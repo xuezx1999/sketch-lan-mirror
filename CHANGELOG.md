@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.5.0 — M4-D Single-file Distribution
+
+### Added
+
+- Bundled Node runtime（Release 包内嵌 darwin arm64 + x64 双架构 node 二进制，用户机器无需安装 Node.js）
+- Gatekeeper/quarantine 处理（内嵌 node 首次使用时复制到 `~/.sketch-lan-mirror/` 并剥除 com.apple.quarantine 后 exec）
+- Usage 菜单命令（插件内查看内嵌 README 使用说明）
+- Auto-update via appcast（manifest `appcast` 字段 + `scripts/package.sh` 生成 `dist/appcast.xml`，配合 GitHub Releases 分发；`LAN_REPO=owner/repo` 打包时写入更新源）
+
+### Changed
+
+- Release zip 只含 `LAN.sketchplugin`（解压即插件，双击即装；不再套版本文件夹和散落 README，README 移入插件 Resources）
+- Node 发现顺序：内嵌二进制优先 → 系统 PATH / 常见位置 / nvm（开发软链模式仍用系统 node）
+
+### Compatibility
+
+- Sketch 2025.3.4
+- macOS（Apple Silicon / Intel）
+- iPhone Safari
+
+---
+
 ## v0.4.0 — M4-C Productized MVP
 
 ### Added

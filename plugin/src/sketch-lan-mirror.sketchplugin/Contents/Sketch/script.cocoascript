@@ -173,6 +173,60 @@ function onOpenLANViewer(context) {
   NSWorkspace.sharedWorkspace().openURL(NSURL.URLWithString(url))
 }
 
+// 使用说明（M4-D）：打开内嵌 README（安装版 Contents/Resources/README.md；
+// 开发软链模式向上找仓库 README.md），弹窗内滚动阅读，失败回退系统默认打开方式
+function onShowUsage(context) {
+  var fm = NSFileManager.defaultManager()
+  var scriptPath = context && context.scriptPath ? String(context.scriptPath) : ''
+  var pluginRoot = pluginRootFromScriptPath(scriptPath)
+  var path = pluginRoot + '/Contents/Resources/README.md'
+  if (!fm.fileExistsAtPath(path)) {
+    // 开发模式：沿目录树向上找仓库 README
+    var dir = pluginRoot
+    for (var i = 0; i < 8; i++) {
+      if (fm.fileExistsAtPath(dir + '/README.md')) { path = dir + '/README.md'; break }
+      var idx = dir.lastIndexOf('/')
+      if (idx <= 0) break
+      dir = dir.slice(0, idx)
+    }
+  }
+  if (!fm.fileExistsAtPath(path)) {
+    notifyInfo('未找到使用说明文件。')
+    return
+  }
+  var text = ''
+  try {
+    text = String(NSString.stringWithContentsOfFile_encoding_error(path, 4, null))
+  } catch (e) {
+    text = ''
+  }
+  if (!text) {
+    NSWorkspace.sharedWorkspace().openFile(path)
+    return
+  }
+  if (silentMode()) {
+    recordResult({ ok: true, info: 'usage' })
+    return
+  }
+  try {
+    var alert = NSAlert.alloc().init()
+    alert.setMessageText('LAN 使用说明')
+    var scroll = NSScrollView.alloc().initWithFrame(NSMakeRect(0, 0, 540, 440))
+    scroll.setHasVerticalScroller(true)
+    scroll.setBorderType(1) // NSBezelBorder
+    var tv = NSTextView.alloc().initWithFrame(NSMakeRect(0, 0, 540, 440))
+    tv.setEditable(false)
+    tv.setRichText(false)
+    tv.setString(text)
+    scroll.setDocumentView(tv)
+    alert.setAccessoryView(scroll)
+    alert.addButtonWithTitle('好')
+    alert.runModal()
+  } catch (e) {
+    NSWorkspace.sharedWorkspace().openFile(path)
+  }
+}
+
 // ── M4-B：Action 入口（统一进 scheduleFrameCheck，不直接 export）────
 // 全部 handler 只做一件事：记录 + 建议立即检查。
 // 是否发送仍由 M4-A hash 决定——事件不是发送条件（ADR-018 §八）。
@@ -706,12 +760,16 @@ var SLM_RUNTIME_DIR = String(NSHomeDirectory()) + '/.sketch-lan-mirror'
 var SLM_RUNTIME_FILE = SLM_RUNTIME_DIR + '/runtime.json'
 var SLM_SERVER = { task: null } // 保 spawn 的 NSTask 引用防 GC（进程本身独立存活）
 
+// 从 scriptPath 解析插件包根目录（软链解析后）
+function pluginRootFromScriptPath(scriptPath) {
+  var p = String(NSString.stringWithString(String(scriptPath)).stringByResolvingSymlinksInPath())
+  return p.replace(/\/Contents\/Sketch\/[^\/]*$/, '') || p
+}
+
 // Server 目录解析：打包模式 Contents/Resources/server；开发软链模式向上找 repo/server
 function findServerDir(scriptPath) {
   var fm = NSFileManager.defaultManager()
-  var p = String(NSString.stringWithString(String(scriptPath)).stringByResolvingSymlinksInPath())
-  var pluginRoot = p.replace(/\/Contents\/Sketch\/[^\/]*$/, '')
-  if (pluginRoot === p) pluginRoot = p // 结构异常时退化为原路径继续向上找
+  var pluginRoot = pluginRootFromScriptPath(scriptPath)
   // 1) 打包模式：sketchplugin 包内自带 server（M4-C 发布形态，ADR-020）
   var bundled = pluginRoot + '/Contents/Resources/server/index.js'
   if (fm.fileExistsAtPath(bundled)) return pluginRoot + '/Contents/Resources/server'
@@ -726,9 +784,61 @@ function findServerDir(scriptPath) {
   return null
 }
 
-// Node 可执行文件发现：PATH → 常见安装位置 → nvm 版本目录（§十二）
-function findNodeExecutable() {
+// 内嵌 Node（M4-D 发布形态）：优先用打包在 Resources/ 的 node 二进制，用户免装 Node.js。
+// 下载 zip 解压后 node 带 com.apple.quarantine，直接 exec 会被 Gatekeeper 拦——
+// 先复制到运行时目录并用 /usr/bin/xattr 剥掉 quarantine，再 exec 副本（一次性，按大小判断是否需重拷）。
+// 注意：发布包内的 node 必须是 lipo 合成的通用（fat）二进制——Sketch 安装时扫描包内
+// Mach-O，架构不匹配的原生二进制会触发 "CPU architecture 不兼容" 弹窗。
+function fileSizeAtPath(fm, path) {
+  try {
+    return Number(fm.attributesOfItemAtPath_error(path, null).fileSize())
+  } catch (e) {
+    return -1
+  }
+}
+
+function stageBundledNode(pluginRoot) {
   var fm = NSFileManager.defaultManager()
+  // 'node' = 通用二进制（现行发布形态）；旧字段名保底，便于过渡期包
+  var names = ['node', 'node-arm64', 'node-x64']
+  for (var i = 0; i < names.length; i++) {
+    var src = pluginRoot + '/Contents/Resources/' + names[i]
+    if (!fm.isExecutableFileAtPath(src)) continue
+    try {
+      if (!fm.fileExistsAtPath(SLM_RUNTIME_DIR)) {
+        fm.createDirectoryAtPath_withIntermediateDirectories_attributes(SLM_RUNTIME_DIR, true, null)
+      }
+      var dst = SLM_RUNTIME_DIR + '/' + names[i]
+      var srcSize = fileSizeAtPath(fm, src)
+      var dstSize = fileSizeAtPath(fm, dst)
+      if (dstSize !== srcSize) { // 版本变化时重拷（同版本同大小则复用，避免每次启动拷 ~220MB）
+        if (fm.fileExistsAtPath(dst)) fm.removeItemAtPath_error(dst, null)
+        fm.copyItemAtPath_toPath_error(src, dst, null)
+      }
+      // 剥 quarantine（无该属性时 xattr 非零退出，忽略即可）
+      try {
+        var Task = (typeof NSTask !== 'undefined') ? NSTask : Process
+        var strip = Task.alloc().init()
+        strip.setLaunchPath('/usr/bin/xattr')
+        strip.setArguments(['-d', 'com.apple.quarantine', dst])
+        strip.launch()
+        strip.waitUntilExit()
+      } catch (e2) {}
+      if (fm.isExecutableFileAtPath(dst)) return dst
+    } catch (e) {
+      log('[LAN Mirror] stage bundled node failed: ' + e)
+    }
+  }
+  return null
+}
+
+// Node 可执行文件发现：内嵌二进制 → PATH → 常见安装位置 → nvm 版本目录（§十二）
+function findNodeExecutable(pluginRoot) {
+  var fm = NSFileManager.defaultManager()
+  if (pluginRoot) {
+    var bundled = stageBundledNode(pluginRoot)
+    if (bundled) return bundled
+  }
   var home = String(NSHomeDirectory())
   var candidates = []
   try {
@@ -859,7 +969,7 @@ function ensureServerRunning(context) {
       error: '找不到 LAN server 目录。\n开发模式请确认仓库完整（server/index.js）；\n安装版请重新安装 LAN 插件。',
     }
   }
-  var node = findNodeExecutable()
+  var node = findNodeExecutable(pluginRootFromScriptPath(scriptPath))
   if (!node) {
     return {
       ok: false,

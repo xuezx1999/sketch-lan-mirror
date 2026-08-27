@@ -1,10 +1,11 @@
 {
   "compatibleVersion": 3,
-  "bundleVersion": 7,
+  "bundleVersion": 8,
   "name": "LAN",
   "identifier": "com.xuezx.sketch-lan-mirror",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "author": "Zhixiang Xue",
+  "appcast": "https://github.com/OWNER/REPO/releases/latest/download/appcast.xml",
   "commands": [
     {
       "script": "script.cocoascript",
@@ -29,11 +30,17 @@
       "name": "Open LAN Viewer",
       "identifier": "open-lan-viewer",
       "handler": "onOpenLANViewer"
+    },
+    {
+      "script": "script.cocoascript",
+      "name": "Usage",
+      "identifier": "show-usage",
+      "handler": "onShowUsage"
     }
   ],
   "menu": {
     "title": "LAN",
-    "items": ["send-current-frame", "start-mirror", "stop-mirror", "open-lan-viewer"]
+    "items": ["send-current-frame", "start-mirror", "stop-mirror", "open-lan-viewer", "-", "show-usage"]
   },
   "handlers": {
     "actions": {

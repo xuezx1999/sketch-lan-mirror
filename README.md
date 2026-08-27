@@ -12,20 +12,22 @@ Sketch ──LAN──► iPhone
 
 从 Sketch 打开一扇窗，让手机看到里面的画面。
 
-**状态：v0.4.0（M4-C Productized MVP，READY FOR MANUAL ACCEPTANCE）**
+**状态：v0.5.0（M4-D 单文件分发，READY FOR MANUAL ACCEPTANCE）**
 
 ## Quick Start
 
-**前提**：Mac 和 iPhone 连接**同一局域网**（Wi-Fi）；Mac 上装有 [Node.js](https://nodejs.org)（Sketch 2025.3.4 实测通过）。
+**前提**：Mac 和 iPhone 连接**同一局域网**（Wi-Fi）。插件内嵌 Node 运行时，**Mac 无需安装 Node.js**（Sketch 2025.3.4 实测通过）。
 
-1. **Install LAN plugin** — 下载 Release 包（`LAN-v0.4.0.zip`），解压后双击 `LAN.sketchplugin` 安装（插件自带 server，无需 clone 仓库、无需 npm install）
+1. **Install LAN plugin** — 下载 Release 包（`LAN-v0.5.0.zip`），解压后双击 `LAN.sketchplugin` 安装（插件自带 Node 运行时与 server，无需 clone 仓库、无需 npm install）
 2. **Start LAN** — Sketch 菜单 `Plugins ▸ LAN ▸ Start LAN`，本地 server 自动启动（已运行则复用）
 3. **Wait for LAN ready** — 弹窗显示访问地址
 4. **Scan QR code with iPhone** — Mac 上 `Plugins ▸ LAN ▸ Open LAN Viewer` 打开扫码页，手机扫码
 5. **Open Viewer** — 手机 Safari 打开，立即看到当前选中的 Artboard
 6. **Optionally Add to Home Screen** — Safari 分享 → 添加到主屏幕，之后从桌面直达（PWA）
 
+使用中有疑问：菜单 `Plugins ▸ LAN ▸ Usage` 查看内嵌使用说明。
 不需要终端运行 `node`，不需要理解 localhost / port / WebSocket。
+有新版本时 Sketch 会自动提示更新（Release 托管于 GitHub Releases，appcast 分发）。
 
 ## 从源码安装（开发者）
 
@@ -33,12 +35,13 @@ Release 包自带内嵌 server（含依赖），最终用户无需本节。若�
 
 ```bash
 git clone <repo-url> && cd lan
-./scripts/package.sh          # 生成 dist/LAN-v0.4.0.zip（内嵌 server + node_modules）
+LAN_REPO=owner/repo ./scripts/package.sh   # 生成 dist/LAN-v0.5.0.zip + appcast.xml
 ```
 
-解压后双击 `LAN.sketchplugin` 安装。开发调试也可将
+解压后双击 `LAN.sketchplugin` 安装（内嵌 Node 运行时 + server + node_modules，
+`LAN_REPO` 用于写入自动更新源，本地测试可省略）。开发调试也可将
 `plugin/src/sketch-lan-mirror.sketchplugin` 软链到 Sketch Plugins 目录
-（插件自动发现仓库内 `server/`，前提：`cd server && npm install`）。
+（插件自动发现仓库内 `server/` 与系统 node，前提：`cd server && npm install`）。
 
 ## 工作方式
 
