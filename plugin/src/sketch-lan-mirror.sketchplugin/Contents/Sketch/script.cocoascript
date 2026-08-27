@@ -1,18 +1,28 @@
-/* Sketch LAN Mirror — M3-A Live Mirror
+/* Sketch LAN Mirror — M4-C Productized（用户可见名：LAN）
  *
  * 菜单：
  *   Send Current Frame  单帧发送（M2 行为，保持不变）
- *   Start Mirror        启动 1s 轮询（setInterval；运行时原生提供，
- *                       NSTimer 的 target/block/delegate 在本环境均不可用，见 DECISIONS ADR-008）
- *   Stop Mirror         停止轮询
+ *   Start LAN           确保 Server 运行（复用/自动启动，ADR-019）+ 启动 Mirror
+ *   Stop LAN            停止 Mirror + 按 PID 精确停止自己启动的 Server
+ *   Open LAN Viewer     打开扫码入口页（Mac 浏览器显示 QR，手机扫码进 Viewer）
  *
- * 策略（刻意最简）：
- *   - 每 1s 全量导出当前选中 Artboard 并 POST，不做 hash/diff/事件监听/防抖
+ * 策略：
+ *   - M4-B：事件加速 + 1s 兜底轮询（ADR-018）——SelectionChanged / ArtboardChanged /
+ *     TextChanged / LayersMoved / LayersResized 统一进 scheduleFrameCheck()，
+ *     80ms debounce 窗口合并事件风暴；事件只是「建议立即检查」，是否 POST 仍由
+ *     M4-A hash 决定（ADR-017）；1s setInterval 兜底（事件失效最多 ~1s 更新）
+ *   - 每 tick 全量导出当前选中 Artboard；PNG SHA-256 与最近一次成功
+ *     POST 的帧一致（且 artboard 身份一致）则跳过 POST（ADR-017）
  *   - 目标解析：选中画板本身或其内部任意图层均可，parent 链向上归属（ADR-012）
  *   - 导出前做渲染缓存刷新（定时器回调里的 export 可能拿到陈旧渲染，见 ADR-010）
  *   - 删除检测：被删画板触发的自动跳选不推帧，保持手机最后一帧（ADR-011）
  *   - latest-frame-only：上一帧未发完（sending=true）则本轮直接跳过，不排队
  *   - 不缓存 Artboard 对象：每 tick 从 document/page/selection 重新解析，只记 id
+ *
+ * Server 生命周期（ADR-019，与 Mirror 状态解耦）：
+ *   Start LAN → 读 ~/.sketch-lan-mirror/runtime.json 复用 / 探测 9777+ 复用 /
+ *   NSTask spawn node → 轮询 /health 就绪 → /info 取 URL；
+ *   Stop LAN → SIGTERM runtime.json 里的 PID（先验证进程身份，绝不 killall node）。
  */
 
 var SERVER_HOST = '127.0.0.1'
@@ -30,24 +40,53 @@ var SLM = {
   lastSendTs: null,
   lastExportMs: null,
   lastPostMs: null,
+  lastSentHash: null,        // M4-A：最近一次成功 POST 的 PNG SHA-256（ADR-017）
+  lastSentArtboardKey: null, // M4-A：该帧的 artboard 身份（id|name|WxH）
+  stats: null,               // M4-A：{ticks, sent, skipped, eventChecks, ...MsSum}
+}
+
+var EVENT_DEBOUNCE_MS = 80
+
+// ── M4-B：事件驱动加速状态（event coalescing，ADR-018）────────
+var SLM_EVENT = {
+  debounceTimerId: null,    // 80ms 合并窗口定时器（窗口内多个 action 合并为一次检查）
+  pendingAfterSend: false,  // 发送期间又有事件到达：本次发送完成后立即补一次检查
+  lastEventTs: null,        // 最近一次 action 到达时间（event→POST 延迟统计）
+  counts: {},               // 各 action 触发次数（验收期诊断：确认哪些 action 真实可用）
 }
 
 // ── 命令入口 ──────────────────────────────────────────────
 function onRun(context) {
+  // M4-C：单帧发送也自动确保 Server 运行（ADR-019）
+  var server = ensureServerRunning(context)
+  if (!server.ok) {
+    notifyError(server.error)
+    return
+  }
+  SERVER_PORT = server.port
   var r = sendCurrentFrameCore()
   if (r.ok) {
     notifyUser('Sent: ' + r.artboard,
-      'PNG ' + formatKB(r.bytes) + ' · export ' + r.exportMs + 'ms · post ' + r.postMs + 'ms · 总耗时 ' + r.totalMs + 'ms')
+      'PNG ' + formatKB(r.bytes) + ' · export ' + r.exportMs + 'ms · hash ' + r.hashMs + 'ms · post ' + r.postMs + 'ms · 总耗时 ' + r.totalMs + 'ms')
   } else {
     notifyError(r.error)
   }
 }
 
-function onStartMirror(context) {
+function onStartLAN(context) {
   if (SLM.running) {
-    notifyInfo('Mirror already running')
+    notifyInfo('LAN is already running')
     return
   }
+
+  // M4-C（ADR-019）：先确保 Server 运行（复用/自动启动），再启动 Mirror。
+  // 顺序保证：Server 起不来时用户看到的是明确错误，不会出现「Mirror 空转」。
+  var server = ensureServerRunning(context)
+  if (!server.ok) {
+    notifyError(server.error)
+    return
+  }
+  SERVER_PORT = server.port // 后续 POST /frame 用实际端口（可能因占用递增过）
 
   // 与单帧发送相同的启动校验：文档 → 页面 → 选中的 Artboard
   var target = resolveTargetArtboard()
@@ -55,6 +94,17 @@ function onStartMirror(context) {
     notifyError(target.error)
     return
   }
+
+  // M4-A：重置 hash 基线与统计（重新 Start 必须重发首帧，ADR-017 §七）
+  SLM.lastSentHash = null
+  SLM.lastSentArtboardKey = null
+  SLM.stats = { ticks: 0, sent: 0, skipped: 0, eventChecks: 0, exportMsSum: 0, hashMsSum: 0, postMsSum: 0 }
+
+  // M4-B：重置事件状态（ADR-018）
+  SLM_EVENT.debounceTimerId = null
+  SLM_EVENT.pendingAfterSend = false
+  SLM_EVENT.lastEventTs = null
+  SLM_EVENT.counts = {}
 
   // 立即发送第一帧（失败则不启动轮询，让用户看到具体错误）
   var first = sendCurrentFrameCore()
@@ -69,31 +119,118 @@ function onStartMirror(context) {
   SLM.running = true
   SLM.suppressedArtboardId = null
   log('[LAN Mirror] started, interval=' + MIRROR_INTERVAL_SEC + 's')
-  notifyInfo('Mirror started\n' + 'http://' + SERVER_HOST + ':' + SERVER_PORT + '\n每 ' + MIRROR_INTERVAL_SEC + 's 自动推送选中 Artboard')
+  notifyUser('LAN started',
+    '手机扫码或直接访问：\n' + server.urls.join('\n') +
+    '\n\nMac 入口页（含 QR）：\nhttp://localhost:' + server.port + '/qr')
 }
 
-function onStopMirror(context) {
-  if (!SLM.running) {
-    notifyInfo('Mirror is not running')
+function onStopLAN(context) {
+  // Mirror 与 Server 是两个独立状态（ADR-019 §二十三）：
+  // Stop LAN = 停 Mirror + 停 Server（不误杀其他 Node 进程）
+  var mirrorWasRunning = SLM.running
+  if (mirrorWasRunning) {
+    clearInterval(SLM.timerId)
+    SLM.timerId = null
+    SLM.running = false
+    SLM.suppressedArtboardId = null
+    SLM.currentPageId = null
+    // M4-B：清理事件状态（残留 debounce 定时器会在 runFrameCheck 里被 running 守卫拦住，这里显式清掉）
+    if (SLM_EVENT.debounceTimerId !== null) {
+      clearTimeout(SLM_EVENT.debounceTimerId)
+      SLM_EVENT.debounceTimerId = null
+    }
+    SLM_EVENT.pendingAfterSend = false
+    SLM_EVENT.lastEventTs = null
+    logStatsSummary(true) // M4-A：输出本次会话 sent/skipped 统计
+    SLM.lastSentHash = null        // 清理 hash 基线（ADR-017 §七）
+    SLM.lastSentArtboardKey = null
+    SLM.stats = null
+    log('[LAN Mirror] stopped')
+  }
+
+  var stopped = stopManagedServer()
+  if (!mirrorWasRunning && !stopped.stopped) {
+    notifyInfo('LAN is not running')
     return
   }
-  clearInterval(SLM.timerId)
-  SLM.timerId = null
-  SLM.running = false
-  SLM.suppressedArtboardId = null
-  SLM.currentPageId = null
-  log('[LAN Mirror] stopped')
-  notifyInfo('Mirror stopped')
+  if (stopped.note) {
+    notifyInfo('LAN stopped\n' + stopped.note)
+  } else {
+    notifyInfo('LAN stopped')
+  }
 }
 
-// ── 每 tick：重新解析目标 → 发帧（latest-frame-only）──────────
+function onOpenLANViewer(context) {
+  // M4-C（ADR-019）：Server 已运行 → 打开扫码入口页（QR + 全部地址）；
+  // 未运行 → 明确提示（不隐式启动，保持「Start LAN 才动 Server」的原则）
+  var server = probeRunningServer()
+  if (!server.ok) {
+    notifyInfo('Start LAN first.\n菜单 Plugins ▸ LAN ▸ Start LAN')
+    return
+  }
+  var url = 'http://localhost:' + server.port + '/qr'
+  log('[LAN Mirror] open entry page: ' + url)
+  NSWorkspace.sharedWorkspace().openURL(NSURL.URLWithString(url))
+}
+
+// ── M4-B：Action 入口（统一进 scheduleFrameCheck，不直接 export）────
+// 全部 handler 只做一件事：记录 + 建议立即检查。
+// 是否发送仍由 M4-A hash 决定——事件不是发送条件（ADR-018 §八）。
+function onSelectionChanged(context) { onMirrorAction('SelectionChanged') }
+function onArtboardChanged(context) { onMirrorAction('ArtboardChanged') }
+function onTextChanged(context) { onMirrorAction('TextChanged') }
+function onLayersMoved(context) { onMirrorAction('LayersMoved') }
+function onLayersResized(context) { onMirrorAction('LayersResized') }
+
+function onMirrorAction(actionName) {
+  if (!SLM.running) return // Mirror 未运行：事件一律忽略，不产生日志噪音
+  SLM_EVENT.lastEventTs = Date.now()
+  var c = (SLM_EVENT.counts[actionName] || 0) + 1
+  SLM_EVENT.counts[actionName] = c
+  // 探针日志：前 3 次逐条记录（确认该 action 在当前 Sketch 真实可用），之后每 50 次记录一次
+  if (c <= 3 || c % 50 === 0) log('[LAN Mirror] action ' + actionName + ' #' + c)
+  scheduleFrameCheck()
+}
+
+// 事件合并：80ms debounce 窗口内多个 action 合并为一次检查（ADR-018 §四）。
+// setTimeout/clearTimeout 由运行时原生提供（ADR-008 实测）。
+function scheduleFrameCheck() {
+  if (!SLM.running) return              // 双保险：Stop 后残留调用直接忽略
+  if (SLM_EVENT.debounceTimerId !== null) return // 合并窗口已开：本事件被合并
+  SLM_EVENT.debounceTimerId = setTimeout(function () {
+    SLM_EVENT.debounceTimerId = null
+    runFrameCheck('event')
+  }, EVENT_DEBOUNCE_MS)
+}
+
+// ── 每 tick：1s 兜底轮询入口（ADR-018 §五）──────────────────
 function mirrorTick() {
+  if (SLM.stats) SLM.stats.ticks++
+  runFrameCheck('poll')
+}
+
+// ── 统一检查入口：事件加速与轮询兜底共用同一条链路（latest-frame-only）──
+// source: 'poll'（1s 兜底） | 'event'（Action 触发的加速检查）
+// 事件路径与轮询路径走完全相同的目标解析 / 删除抑制 / hash 跳过逻辑——
+// 事件只是把「下一次检查的时间」提前，不引入任何新语义。
+function runFrameCheck(source) {
+  if (!SLM.running) return
   if (SLM.sending) {
-    // 上一帧仍在 export/POST：跳过本轮，绝不排队、绝不并发
-    log('[LAN Mirror] tick skipped (previous frame in flight)')
+    // 上一帧仍在 export/POST：绝不排队、绝不并发
+    if (source === 'event') {
+      // 事件路径：记 pending，本次发送完成后立即补一次检查（仍然 latest-frame-only）
+      SLM_EVENT.pendingAfterSend = true
+    } else {
+      log('[LAN Mirror] tick skipped (previous frame in flight)')
+    }
     return
   }
   SLM.sending = true
+  if (source === 'event' && SLM.stats) SLM.stats.eventChecks++
+  var eventLatencyMs = null
+  if (source === 'event' && SLM_EVENT.lastEventTs) {
+    eventLatencyMs = Date.now() - SLM_EVENT.lastEventTs // 事件→开始检查（≈debounce 窗口）
+  }
   try {
     var target = resolveTargetArtboard()
     if (!target.ok) {
@@ -113,7 +250,7 @@ function mirrorTick() {
       SLM.suppressedArtboardId = null
     }
 
-    // ── 删除检测（ADR-011）────────────────────────────────
+    // ── 删除检测（ADR-011，事件/轮询路径都必须保持）───────────
     // 上一次推送的 Artboard 已从页面消失 → 本次选区是 Sketch 删除后的「自动跳选」，
     // 抑制该帧不推送，保持手机最后一帧；用户后续手动选中另一个不同 id 的 Artboard 才恢复。
     if (SLM.currentArtboardId !== null && target.artboardId !== SLM.currentArtboardId) {
@@ -136,27 +273,55 @@ function mirrorTick() {
       log('[LAN Mirror] artboard switched -> "' + target.artboard.name + '", sending immediately')
     }
 
-    // 定时器回调里的 export 会拿到陈旧渲染缓存（ADR-010），先做无损刷新
+    // 定时器/事件回调里的 export 会拿到陈旧渲染缓存（ADR-010），先做无损刷新
     forceRenderFlush()
 
-    var r = exportAndPost(target.artboard)
+    var r = exportAndPost(target.artboard, { skipIfUnchanged: true })
+    if (r.skipped) {
+      // M4-A：内容未变化，跳过 POST（export 仍执行以计算哈希，ADR-017）
+      if (SLM.stats) {
+        SLM.stats.skipped++
+        SLM.stats.exportMsSum += r.exportMs
+        SLM.stats.hashMsSum += r.hashMs
+      }
+      log('[LAN Mirror] unchanged, POST skipped [' + source + '] (export=' + r.exportMs + 'ms hash=' + r.hashMs + 'ms)')
+      logStatsSummary(false)
+      return
+    }
     if (r.ok) {
       SLM.currentArtboardId = r.artboardId
       SLM.currentPageId = target.pageId
       SLM.lastSendTs = Date.now()
       SLM.lastExportMs = r.exportMs
       SLM.lastPostMs = r.postMs
+      if (SLM.stats) {
+        SLM.stats.sent++
+        SLM.stats.exportMsSum += r.exportMs
+        SLM.stats.hashMsSum += r.hashMs
+        SLM.stats.postMsSum += r.postMs
+      }
+      // 事件路径记录 event→POST 端到端延迟（ADR-018 §十一性能观测）
+      var latencyTag = ''
+      if (source === 'event' && eventLatencyMs !== null) {
+        latencyTag = ' [event→post ' + (eventLatencyMs + r.totalMs) + 'ms]'
+      }
       log('[LAN Mirror] frame "' + r.artboard + '" ' + formatKB(r.bytes) +
-          ' export=' + r.exportMs + 'ms post=' + r.postMs + 'ms total=' + r.totalMs +
-          (switched ? ' [switched]' : ''))
+          ' export=' + r.exportMs + 'ms hash=' + r.hashMs + 'ms post=' + r.postMs + 'ms total=' + r.totalMs +
+          latencyTag + (switched ? ' [switched]' : ''))
+      logStatsSummary(false)
     } else {
       // 单帧失败不中断镜像（如 server 重启中），下个 tick 自然重试
-      log('[LAN Mirror] tick send failed: ' + r.error.replace(/\n/g, ' '))
+      log('[LAN Mirror] ' + source + ' send failed: ' + r.error.replace(/\n/g, ' '))
     }
   } catch (err) {
-    log('[LAN Mirror] tick error: ' + err)
+    log('[LAN Mirror] ' + source + ' check error: ' + err)
   } finally {
     SLM.sending = false
+    // 事件在本次发送期间到达（被 pending 记住）：立即补一次检查（自带 80ms 合并窗口）
+    if (SLM_EVENT.pendingAfterSend && SLM.running) {
+      SLM_EVENT.pendingAfterSend = false
+      scheduleFrameCheck()
+    }
   }
 }
 
@@ -308,9 +473,13 @@ function tryFlushOnce(key, obj, selector, fn) {
   }
 }
 
-// ── 核心流程：export → toNSData → 同步 POST（M2 已验证路径）───
-function exportAndPost(artboard) {
+// ── 核心流程：export → toNSData → hash → 同步 POST（M2 已验证路径）───
+// opts.skipIfUnchanged=true（Mirror tick 路径）：PNG SHA-256 与最近一次成功
+// POST 的帧一致 且 artboard 身份一致 → 跳过 POST（M4-A，ADR-017）。
+// 手动 Send Current Frame 不传该参数：永远发送并刷新基线。
+function exportAndPost(artboard, opts) {
   var sketch = require('sketch')
+  opts = opts || {}
   var startedAt = Date.now()
 
   var exportStart = Date.now()
@@ -345,10 +514,35 @@ function exportAndPost(artboard) {
   var pngData = toNSData(pngSource)
   var convertMs = Date.now() - convertStart
 
+  // M4-A：帧变化检测——计算 PNG SHA-256（ADR-017）
+  var hashStart = Date.now()
+  var hash = pngDigest(pngData, pngSource)
+  var hashMs = Date.now() - hashStart
+  var artboardKey = String(artboard.id) + '|' + String(artboard.name) + '|' +
+    Math.round(artboard.frame.width) + 'x' + Math.round(artboard.frame.height)
+
+  // 跳过条件三要素：哈希相同 + artboard 身份相同 + 上次确实成功发送过。
+  // 身份比对防止两个不同 Artboard 恰好导出相同 PNG 时被误跳过（§六）。
+  if (opts.skipIfUnchanged && hash && SLM.lastSentHash === hash && SLM.lastSentArtboardKey === artboardKey) {
+    return {
+      ok: true, skipped: true,
+      artboard: String(artboard.name),
+      artboardId: String(artboard.id),
+      bytes: Number(pngData.length()),
+      exportMs: exportMs, convertMs: convertMs, hashMs: hashMs,
+    }
+  }
+
   var postStart = Date.now()
   var statusCode = postFrame(pngData, String(artboard.name), Math.round(artboard.frame.width), Math.round(artboard.frame.height))
   var postMs = Date.now() - postStart
   var totalMs = Date.now() - startedAt
+
+  // 只有 POST 成功才更新 hash 基线（§八：失败帧下个 tick 必须重发）
+  if (statusCode === 200 && hash) {
+    SLM.lastSentHash = hash
+    SLM.lastSentArtboardKey = artboardKey
+  }
 
   return {
     ok: statusCode === 200,
@@ -358,9 +552,136 @@ function exportAndPost(artboard) {
     bytes: Number(pngData.length()),
     exportMs: exportMs,
     convertMs: convertMs,
+    hashMs: hashMs,
     postMs: postMs,
     totalMs: totalMs,
   }
+}
+
+// ── M4-A：PNG 哈希（SHA-256，ADR-017）─────────────────────
+// 环境研究结论：
+//   - 无 Node crypto（手写 bundle，无构建链）；skpm Buffer 无 hash 方法
+//   - CommonCrypto CC_SHA256 等纯 C 函数无法从 CocoaScript 桥接调用
+//   - NSData.hash 不可靠（现代实现只采样首尾字节，同长度中间改动会漏检）
+// 可用策略：
+//   ① CloudKit CKSHA256（系统框架 Obj-C 类，ObjC.import 桥接，原生速度）
+//   ② 纯 JS SHA-256 兜底（正确性已对拍 node crypto，速度约 2~6 MB/s）
+var SLM_HASH = { strategy: null, ckImported: false }
+
+function pngDigest(pngData, pngBuffer) {
+  if (SLM_HASH.strategy !== 'js') {
+    if (!SLM_HASH.ckImported) {
+      SLM_HASH.ckImported = true
+      try { ObjC.import('CloudKit') } catch (e) {}
+    }
+    if (typeof CKSHA256 !== 'undefined' && CKSHA256) {
+      var hex = null
+      try {
+        var d = CKSHA256.digestWithData(pngData)
+        if (d) hex = String(d.description()).toLowerCase().replace(/[^0-9a-f]/g, '')
+      } catch (e) {}
+      if (hex && hex.length === 64) {
+        if (SLM_HASH.strategy !== 'ck') {
+          SLM_HASH.strategy = 'ck'
+          log('[LAN Mirror] hash strategy: CKSHA256 (native)')
+        }
+        return hex
+      }
+    }
+    SLM_HASH.strategy = 'js'
+    log('[LAN Mirror] hash strategy: pure-JS SHA-256 fallback')
+  }
+  return sha256HexBytes(pngBuffer)
+}
+
+// ── 纯 JS SHA-256（兜底；输入支持 buf[i]/buf.length 的字节容器）──
+var SHA256_K = [
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]
+
+function sha256HexBytes(buf) {
+  var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+           0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+  var len = buf.length
+  var fullBlocks = len >> 6
+  var i, t
+  for (i = 0; i < fullBlocks; i++) sha256Compress(H, buf, i << 6)
+
+  // 尾块 + padding（0x80 + 0 填充 + 64 位大端长度）
+  var rem = len & 63
+  var tail = new Uint8Array(64)
+  var base = fullBlocks * 64
+  for (t = 0; t < rem; t++) tail[t] = buf[base + t]
+  tail[rem] = 0x80
+  if (rem >= 56) { // 剩余空间放不下长度字段：先压缩本块，再补一块
+    sha256Compress(H, tail, 0)
+    tail = new Uint8Array(64)
+  }
+  var bitsHi = Math.floor(len / 536870912)            // len*8 的高 32 位（2^29 字节以上才非零）
+  var bitsLo = (len - bitsHi * 536870912) * 8
+  var dv = new DataView(tail.buffer)
+  dv.setUint32(56, bitsHi >>> 0) // 64 位大端长度：高 32 位在前（bytes 56-59）
+  dv.setUint32(60, bitsLo >>> 0) //                     低 32 位在后（bytes 60-63）
+  sha256Compress(H, tail, 0)
+
+  var hex = ''
+  for (i = 0; i < 8; i++) {
+    var v = H[i] >>> 0
+    hex += (v + 0x100000000).toString(16).slice(1) // 补零到 8 位十六进制
+  }
+  return hex
+}
+
+function sha256Compress(H, b, o) {
+  var w = new Array(64)
+  var t
+  for (t = 0; t < 16; t++) {
+    var i4 = o + (t << 2)
+    w[t] = ((b[i4] << 24) | (b[i4 + 1] << 16) | (b[i4 + 2] << 8) | b[i4 + 3]) | 0
+  }
+  for (t = 16; t < 64; t++) {
+    var w15 = w[t - 15], w2 = w[t - 2]
+    var s0 = ((w15 >>> 7) | (w15 << 25)) ^ ((w15 >>> 18) | (w15 << 14)) ^ (w15 >>> 3)
+    var s1 = ((w2 >>> 17) | (w2 << 15)) ^ ((w2 >>> 19) | (w2 << 13)) ^ (w2 >>> 10)
+    w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0
+  }
+  var a = H[0], bb = H[1], c = H[2], d = H[3]
+  var e = H[4], f = H[5], g = H[6], h = H[7]
+  for (t = 0; t < 64; t++) {
+    var S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7))
+    var ch = (e & f) ^ (~e & g)
+    var t1 = (h + S1 + ch + SHA256_K[t] + w[t]) | 0
+    var S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10))
+    var maj = (a & bb) ^ (a & c) ^ (bb & c)
+    var t2 = (S0 + maj) | 0
+    h = g; g = f; f = e; e = (d + t1) | 0
+    d = c; c = bb; bb = a; a = (t1 + t2) | 0
+  }
+  H[0] = (H[0] + a) | 0; H[1] = (H[1] + bb) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0
+  H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0
+}
+
+// ── M4-A/M4-B：统计汇总（每 30 ticks 及 Stop 时输出，ADR-017 §十一 / ADR-018）──
+function logStatsSummary(force) {
+  var s = SLM.stats
+  if (!s) return
+  if (!force && (s.ticks === 0 || s.ticks % 30 !== 0)) return
+  var processed = s.sent + s.skipped
+  var avgExport = processed ? Math.round(s.exportMsSum / processed) : 0
+  var avgHash = processed ? (s.hashMsSum / processed).toFixed(1) : 0
+  var avgPost = s.sent ? Math.round(s.postMsSum / s.sent) : 0
+  var eventsTotal = 0
+  for (var k in SLM_EVENT.counts) eventsTotal += SLM_EVENT.counts[k]
+  log('[LAN Mirror] stats ' + s.ticks + 't: sent=' + s.sent + ' skipped=' + s.skipped +
+      ' events=' + eventsTotal + ' eventChecks=' + s.eventChecks +
+      ' avgExport=' + avgExport + 'ms avgHash=' + avgHash + 'ms avgPost=' + avgPost + 'ms')
 }
 
 // Send Current Frame 复用同一条链路
@@ -375,6 +696,268 @@ function sendCurrentFrameCore() {
   r.height = target.height
   r.pageId = target.pageId
   return r
+}
+
+// ══ M4-C：Server 生命周期管理（ADR-019）════════════════════
+// Server 与 Mirror 状态解耦：Server RUNNING ≠ Mirror RUNNING。
+// 只通过 runtime.json（PID）+ /health 身份验证 + ps 命令行验证管理自己
+// 启动的 server 进程，绝不 killall node（§十一）。
+var SLM_RUNTIME_DIR = String(NSHomeDirectory()) + '/.sketch-lan-mirror'
+var SLM_RUNTIME_FILE = SLM_RUNTIME_DIR + '/runtime.json'
+var SLM_SERVER = { task: null } // 保 spawn 的 NSTask 引用防 GC（进程本身独立存活）
+
+// Server 目录解析：打包模式 Contents/Resources/server；开发软链模式向上找 repo/server
+function findServerDir(scriptPath) {
+  var fm = NSFileManager.defaultManager()
+  var p = String(NSString.stringWithString(String(scriptPath)).stringByResolvingSymlinksInPath())
+  var pluginRoot = p.replace(/\/Contents\/Sketch\/[^\/]*$/, '')
+  if (pluginRoot === p) pluginRoot = p // 结构异常时退化为原路径继续向上找
+  // 1) 打包模式：sketchplugin 包内自带 server（M4-C 发布形态，ADR-020）
+  var bundled = pluginRoot + '/Contents/Resources/server/index.js'
+  if (fm.fileExistsAtPath(bundled)) return pluginRoot + '/Contents/Resources/server'
+  // 2) 开发模式：沿目录树向上找 server/index.js（软链解析后即仓库内）
+  var dir = pluginRoot
+  for (var i = 0; i < 8; i++) {
+    if (fm.fileExistsAtPath(dir + '/server/index.js')) return dir + '/server'
+    var idx = dir.lastIndexOf('/')
+    if (idx <= 0) break
+    dir = dir.slice(0, idx)
+  }
+  return null
+}
+
+// Node 可执行文件发现：PATH → 常见安装位置 → nvm 版本目录（§十二）
+function findNodeExecutable() {
+  var fm = NSFileManager.defaultManager()
+  var home = String(NSHomeDirectory())
+  var candidates = []
+  try {
+    var pathEnv = String(NSProcessInfo.processInfo().environment().objectForKey('PATH'))
+    var parts = pathEnv.split(':')
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i]) candidates.push(parts[i] + '/node')
+    }
+  } catch (e) {}
+  candidates.push('/opt/homebrew/bin/node')
+  candidates.push('/usr/local/bin/node')
+  candidates.push('/usr/bin/node')
+  candidates.push(home + '/.volta/bin/node')
+  candidates.push(home + '/.local/bin/node')
+  candidates.push(home + '/.local/share/fnm/aliases/default/bin/node')
+  try {
+    var nvmVersions = home + '/.nvm/versions/node'
+    if (fm.fileExistsAtPath(nvmVersions)) {
+      var names = fm.contentsOfDirectoryAtPath_error(nvmVersions, null)
+      var n = names ? Number(names.count()) : 0
+      for (var j = 0; j < n; j++) {
+        candidates.push(nvmVersions + '/' + String(names.objectAtIndex(j)) + '/bin/node')
+      }
+    }
+  } catch (e) {}
+  for (var k = 0; k < candidates.length; k++) {
+    if (fm.isExecutableFileAtPath(candidates[k])) return candidates[k]
+  }
+  return null
+}
+
+// 同步 GET JSON（loopback；失败/非 200 返回 null，绝不抛异常）
+function httpGetJson(port, path, timeoutSec) {
+  try {
+    var url = NSURL.URLWithString('http://127.0.0.1:' + port + path)
+    var req = NSMutableURLRequest.requestWithURL(url)
+    req.setTimeoutInterval(timeoutSec)
+    function newPtr() {
+      try { return MOPointer.alloc().init() } catch (e) { return MOPointer.new() }
+    }
+    var respPtr = newPtr()
+    var errPtr = newPtr()
+    var data = NSURLConnection.sendSynchronousRequest_returningResponse_error(req, respPtr, errPtr)
+    if (!data) return null
+    var statusCode = 0
+    try { statusCode = Number(respPtr.value().statusCode()) } catch (e) {}
+    if (statusCode !== 200) return null
+    var body = String(NSString.alloc().initWithData_encoding(data, 4)) // NSUTF8StringEncoding
+    return JSON.parse(body)
+  } catch (e) {
+    return null
+  }
+}
+
+function readRuntimeFile() {
+  try {
+    var s = String(NSString.stringWithContentsOfFile_encoding_error(SLM_RUNTIME_FILE, 4, null))
+    if (!s) return null
+    var rt = JSON.parse(s)
+    return rt && rt.pid && rt.port ? rt : null
+  } catch (e) {
+    return null
+  }
+}
+
+// 从运行中的 server 取访问入口；/info 不可用（旧版 server）时降级为 localhost
+function serverInfoFrom(h, port) {
+  var info = httpGetJson(port, '/info', 2)
+  var urls = info && info.urls && info.urls.length ? info.urls : ['http://localhost:' + port]
+  return {
+    ok: true,
+    port: port,
+    urls: urls,
+    primary: (info && info.primary) || urls[0],
+  }
+}
+
+// 探测已运行的 server：runtime.json 指向的端口 → 默认端口段（兼容手动启动）
+function probeRunningServer() {
+  var rt = readRuntimeFile()
+  if (rt) {
+    var h = httpGetJson(rt.port, '/health', 2)
+    if (h && h.ok && h.service === 'sketch-lan-mirror') return serverInfoFrom(h, rt.port)
+  }
+  for (var port = 9777; port < 9777 + 10; port++) {
+    var h2 = httpGetJson(port, '/health', 1)
+    if (h2 && h2.ok && h2.service === 'sketch-lan-mirror') return serverInfoFrom(h2, port)
+  }
+  return { ok: false }
+}
+
+// 主线程短暂让路（保持 runloop 活着，UI 不冻结）
+function runLoopDelay(sec) {
+  NSRunLoop.currentRunLoop().runMode_beforeDate(NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow(sec))
+}
+
+// 通用同步子进程执行（捕获 stdout，用于 ps 身份验证）
+function runCommandCapture(bin, args) {
+  try {
+    var Task = (typeof NSTask !== 'undefined') ? NSTask : Process
+    var task = Task.alloc().init()
+    task.setLaunchPath(bin)
+    task.setArguments(args)
+    var pipe = NSPipe.pipe()
+    task.setStandardOutput(pipe)
+    task.launch()
+    task.waitUntilExit()
+    var data = pipe.fileHandleForReading().readDataToEndOfFile()
+    return String(NSString.alloc().initWithData_encoding(data, 4))
+  } catch (e) {
+    return null
+  }
+}
+
+// Start LAN / Send Current Frame 前置：确保 server 就绪（复用优先，否则 spawn）
+function ensureServerRunning(context) {
+  var probed = probeRunningServer()
+  if (probed.ok) {
+    log('[LAN Mirror] server reused on port ' + probed.port)
+    return probed
+  }
+
+  var scriptPath = context && context.scriptPath ? String(context.scriptPath) : ''
+  var serverDir = findServerDir(scriptPath)
+  if (!serverDir) {
+    return {
+      ok: false,
+      error: '找不到 LAN server 目录。\n开发模式请确认仓库完整（server/index.js）；\n安装版请重新安装 LAN 插件。',
+    }
+  }
+  var node = findNodeExecutable()
+  if (!node) {
+    return {
+      ok: false,
+      error: 'LAN requires Node.js.\n未找到可用的 node 可执行文件。\n请安装 Node.js 后重试：https://nodejs.org',
+    }
+  }
+
+  // spawn：stdout/stderr → ~/.sketch-lan-mirror/server.log（排错用）
+  var fm = NSFileManager.defaultManager()
+  var logPath = SLM_RUNTIME_DIR + '/server.log'
+  try {
+    if (!fm.fileExistsAtPath(SLM_RUNTIME_DIR)) {
+      fm.createDirectoryAtPath_withIntermediateDirectories_attributes(SLM_RUNTIME_DIR, true, null)
+    }
+    if (fm.fileExistsAtPath(logPath)) fm.removeItemAtPath_error(logPath, null)
+    fm.createFileAtPath_attributes(logPath, null)
+  } catch (e) {}
+
+  try {
+    var Task = (typeof NSTask !== 'undefined') ? NSTask : Process
+    var task = Task.alloc().init()
+    task.setLaunchPath(node)
+    task.setArguments([serverDir + '/index.js'])
+    var fh = NSFileHandle.fileHandleForWritingAtPath(logPath)
+    if (fh) {
+      task.setStandardOutput(fh)
+      task.setStandardError(fh)
+    }
+    task.launch()
+    SLM_SERVER.task = task
+  } catch (e) {
+    return { ok: false, error: 'Server 启动失败：' + e }
+  }
+
+  // 等待就绪：轮询 /health（端口可能因占用递增，server 成功后会写 runtime.json）
+  var deadline = Date.now() + 4000
+  while (Date.now() < deadline) {
+    runLoopDelay(0.25)
+    var rt = probeRunningServer()
+    if (rt.ok) {
+      log('[LAN Mirror] server started on port ' + rt.port + ' (node: ' + node + ')')
+      return rt
+    }
+  }
+  // 超时：带出 log 尾部辅助排错
+  var tail = ''
+  try {
+    var logText = String(NSString.stringWithContentsOfFile_encoding_error(logPath, 4, null)) || ''
+    tail = logText.slice(-400)
+  } catch (e) {}
+  return {
+    ok: false,
+    error: 'Server 启动超时（4s）。\n日志：' + logPath + '\n' + tail,
+  }
+}
+
+// Stop LAN 副作用：按 runtime.json 的 PID 精确停止 server（三重身份验证）
+function stopManagedServer() {
+  var rt = readRuntimeFile()
+  if (!rt) {
+    // 无 runtime 记录：可能是手动启动的 server——不能验证身份，不动它
+    var live = probeRunningServer()
+    if (live.ok) {
+      return { stopped: false, note: 'Server 是手动启动的，未停止（PID 未记录，安全起见不干预）。' }
+    }
+    return { stopped: false }
+  }
+
+  // 验证 1：该端口确实是我们的服务
+  var h = httpGetJson(rt.port, '/health', 2)
+  if (!(h && h.ok && h.service === 'sketch-lan-mirror')) {
+    // 已死或不是我们的：清理 stale runtime 文件即可
+    try { NSFileManager.defaultManager().removeItemAtPath_error(SLM_RUNTIME_FILE, null) } catch (e) {}
+    return { stopped: false }
+  }
+
+  // 验证 2：PID 对应进程的命令行包含 index.js（防 PID 复用误杀）
+  var cmd = runCommandCapture('/bin/ps', ['-p', String(rt.pid), '-o', 'command='])
+  if (!cmd || cmd.indexOf('index.js') === -1) {
+    return { stopped: false, note: '无法确认 server 进程身份（PID ' + rt.pid + '），未停止。' }
+  }
+
+  // SIGTERM（server 侧 graceful shutdown 并自清 runtime 文件）
+  try {
+    runCommandCapture('/bin/kill', ['-TERM', String(rt.pid)])
+  } catch (e) {
+    return { stopped: false, note: '停止 server 失败：' + e }
+  }
+  // 等待退出确认（最多 2s）
+  for (var i = 0; i < 8; i++) {
+    runLoopDelay(0.25)
+    var h2 = httpGetJson(rt.port, '/health', 1)
+    if (!h2) {
+      log('[LAN Mirror] server stopped (pid ' + rt.pid + ')')
+      return { stopped: true }
+    }
+  }
+  return { stopped: false, note: 'Server 停止超时，请检查 ~/.sketch-lan-mirror/server.log' }
 }
 
 // ── 网络：同步 POST（ADR-004：异步回调在本环境不可用）─────────

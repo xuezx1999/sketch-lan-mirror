@@ -1,111 +1,105 @@
-# Sketch LAN Mirror
+<p align="center"><img src="brand/logo.svg" width="96" alt="LAN"></p>
 
-通过同一局域网内的手机 Safari，实时查看 Mac 上 Sketch 当前选中的 Artboard。
+# LAN
 
-**状态：M3-A 验收通过（2026-08-26，v0.3.2）；M3-C Viewer 架构重写完成并真机验收（2026-08-27）。**
+**Real-time Sketch preview over LAN.**
 
-## Mobile Viewer（M3-C，现行架构）
-
-三层 DOM：app shell（body flex 列 + safe-area）/ Normal Viewer（固定视口 fit + pinch + pan）/ Immersive Viewer（流布局可滚动，双击进出）：
-
-- **Normal**：默认 Fit to Screen 整板可见；双指 Pinch（以两指中点为锚，范围 `[fitScale, 5]`）；放大后单指 Pan（±48px 边缘 overscroll）；新帧不跳视口
-- **Immersive**：双击进入，图片 width-fit + body 原生滚动（长图滑动）；pinch 焦点跟手（rAF 动画提交 scrollY，松手不跳）；双击退出；不记忆上次 zoom
-- 画板切换自动退出 Immersive 回 Normal 并重新 Fit；跨 Page 切换正常推送（plugin 侧 pageId 检测）
-- iOS PWA 布局：`bootViewportRecalc` 启动时把视口撑到全屏（见 DECISIONS ADR-014~016），docInfo 紧贴 Home Indicator 安全区上沿
-
-> 注意：server 启动时缓存页面，改 `public/index.html` 后需重启 server。
+Preview your Sketch Artboards on your phone, in real time, over your local network.
 
 ```
-Sketch 2026.2 插件 ──POST PNG──► Node LAN Server ──WebSocket──► iPhone Safari
-     (选中 Artboard)               http://<lan-ip>:9777            <img> 实时刷新
+Sketch ──LAN──► iPhone
 ```
 
-## 快速开始
+从 Sketch 打开一扇窗，让手机看到里面的画面。
 
-### 1. 启动 Server（Mac）
+**状态：v0.4.0（M4-C Productized MVP，READY FOR MANUAL ACCEPTANCE）**
+
+## Quick Start
+
+**前提**：Mac 和 iPhone 连接**同一局域网**（Wi-Fi）；Mac 上装有 [Node.js](https://nodejs.org)（Sketch 2025.3.4 实测通过）。
+
+1. **Install LAN plugin** — 下载 Release 包（`LAN-v0.4.0.zip`），解压后双击 `LAN.sketchplugin` 安装（插件自带 server，无需 clone 仓库、无需 npm install）
+2. **Start LAN** — Sketch 菜单 `Plugins ▸ LAN ▸ Start LAN`，本地 server 自动启动（已运行则复用）
+3. **Wait for LAN ready** — 弹窗显示访问地址
+4. **Scan QR code with iPhone** — Mac 上 `Plugins ▸ LAN ▸ Open LAN Viewer` 打开扫码页，手机扫码
+5. **Open Viewer** — 手机 Safari 打开，立即看到当前选中的 Artboard
+6. **Optionally Add to Home Screen** — Safari 分享 → 添加到主屏幕，之后从桌面直达（PWA）
+
+不需要终端运行 `node`，不需要理解 localhost / port / WebSocket。
+
+## 从源码安装（开发者）
+
+Release 包自带内嵌 server（含依赖），最终用户无需本节。若直接 clone 本仓库：
 
 ```bash
-cd server
-npm install        # 唯一依赖 ws，首次执行
-node index.js      # 默认端口 9777，被占用自动递增
+git clone <repo-url> && cd lan
+./scripts/package.sh          # 生成 dist/LAN-v0.4.0.zip（内嵌 server + node_modules）
 ```
 
-启动后打印 Local / LAN / WebSocket 地址。手机访问 **LAN 地址**。
+解压后双击 `LAN.sketchplugin` 安装。开发调试也可将
+`plugin/src/sketch-lan-mirror.sketchplugin` 软链到 Sketch Plugins 目录
+（插件自动发现仓库内 `server/`，前提：`cd server && npm install`）。
 
-> 注意：如果 shell 环境注入了 `NODE_OPTIONS=--use-system-ca` 会与 Node 22.12 冲突，
-> 用 `env -u NODE_OPTIONS node index.js` 启动。
-
-### 2. 安装插件（Mac）
-
-插件目录已软链到 Sketch 插件目录：
+## 工作方式
 
 ```
-~/Library/Application Support/com.bohemiancoding.sketch3/Plugins/sketch-lan-mirror.sketchplugin
-  → 本仓库 plugin/src/sketch-lan-mirror.sketchplugin
+Sketch 插件（选中 Artboard）
+   │  export PNG → SHA-256（无变化不推送）
+   │  事件加速（编辑后 ~100-400ms）+ 1s 兜底轮询
+   ↓ POST /frame
+Node LAN Server（Start LAN 自动启动，端口 9777 起）
+   ↓ WebSocket
+iPhone Safari / PWA 实时刷新
 ```
 
-**重启 Sketch** 后，菜单栏出现：
+- **内容未变化不重复推送**：每次检查计算 PNG SHA-256，与最近一次成功 POST 的帧一致则跳过（静止画板只有首帧走网络，ADR-017）
+- **事件驱动加速**：编辑触发 Sketch Action → 80ms 合并窗口 → 立即检查；事件失效时 1s 轮询兜底（ADR-018）
+- **Server 生命周期**：`Start LAN` 自动启动/复用（`~/.sketch-lan-mirror/runtime.json` 记录 PID/端口，只精确停止自己启动的进程，ADR-019）
+- 手机端：断线重连、pinch zoom、双击沉浸模式、跨 Page/画板切换、删除画板保持最后一帧（M3-C 真机验收）
+
+## 兼容性
+
+Tested with:
+
+- Sketch 2025.3.4
+- macOS
+- iPhone Safari / iOS PWA
+
+不声称支持其他 Sketch 版本。
+
+## 安全
+
+LAN 是**本地网络工具**，无登录/鉴权/云端。**同一局域网内的任何人都可能访问 Viewer。** 在不可信网络（公共 Wi-Fi）使用请自行注意。
+
+## 菜单
 
 ```
-Plugins ▸ Sketch LAN Mirror ▸ Send Current Frame
+Plugins ▸ LAN
+├── Send Current Frame   # 单帧发送（调试用）
+├── Start LAN            # 启动 Server + Mirror
+├── Stop LAN             # 停止 Mirror + Server
+└── Open LAN Viewer      # 打开扫码入口页（未运行时提示 Start LAN first）
 ```
 
-### 3. 发送一帧 / 实时镜像
-
-1. 手机 Safari 打开 server 打印的 LAN 地址（如 `http://192.168.x.x:9777`）
-   - 首次访问 iOS 会请求「本地网络」权限，允许
-   - 页面绿点 = 已连接
-2. Sketch 菜单：
-
-```
-Plugins ▸ Sketch LAN Mirror
-├── Send Current Frame   # 单帧发送
-├── Start Mirror         # 开始 1s 自动轮询当前选中 Artboard
-└── Stop Mirror          # 停止轮询
-```
-
-- `Start Mirror`：立即发第一帧，之后每秒自动推送；改 Sketch 内容手机最迟 ~1s 更新
-- **选中画板内任意图层/组即可推送所属画板**（parent 链向上归属，无需点击外框选中整体）
-- 重复 Start 会提示 "Mirror already running"，不会创建第二个定时器
-- 未选中 Artboard（或选区不在任何画板内）时 tick 只记日志、保留手机最后一帧
-- 切换选中的 Artboard 后下个 tick 立即切换画面；跨画板多选时优先保持当前画板
-- 上一帧未发完时跳过本轮（latest-frame-only，不排队）
-- 每 tick 导出前做渲染缓存刷新（定时器回调里的 `sketch.export` 可能拿到陈旧渲染，ADR-010）
-- 运行中删除当前 Artboard：Sketch 的自动跳选**不会**被推送到手机（保持最后一帧），
-  手动选中其他画板（含其内部图层）后恢复推送（ADR-011）
-
-## 手动测试（无插件）
-
-```bash
-# 推一张本机图片
-curl -X POST http://localhost:9777/frame \
-  -H 'Content-Type: image/png' \
-  -H 'x-artboard-name: TestBoard' -H 'x-width: 375' -H 'x-height: 812' \
-  --data-binary @test.png
-```
-
-| 端点 | 说明 |
-|---|---|
-| `GET /` | 手机端页面 |
-| `GET /health` | `{"ok":true,"service":"sketch-lan-mirror"}` |
-| `GET /current` | 最新 PNG（无则 404） |
-| `POST /frame` | PNG body + `x-artboard-name`/`x-width`/`x-height`/`x-ts`（非 ASCII 名称需百分号编码） |
-| WebSocket `/` | 二进制 PNG 帧；连接即补发当前帧 |
-
-手机端特性：断线指数退避重连（1s→15s）、回前台立即重连并拉取 `/current` 补帧。
+手动运行 server（可选）：`cd server && node index.js`——启动时终端直接显示 QR。
 
 ## 目录结构
 
 ```
-docs/ARCHITECTURE.md    总体技术方案（M0）
-docs/DECISIONS.md       实测决策记录（必读，含 API 真实行为与坑）
-server/                 M1：独立 Node 服务（仅依赖 ws）
-plugin/src/*.sketchplugin   M2：Sketch 插件（手写 bundle，零构建链）
+brand/                 Logo / 图标（窗台 mark，docs/BRAND.md）
+docs/ARCHITECTURE.md   总体技术方案（M0）
+docs/DECISIONS.md      实测决策记录（必读，含 API 真实行为与坑）
+docs/BRAND.md          品牌与 Logo 设计记录
+docs/RELEASE.md        发布流程
+server/                Node 服务（原生 http + ws + qrcode-generator）
+plugin/src/*.sketchplugin  Sketch 插件（手写 bundle，零构建链）
+scripts/package.sh     Release 打包（维护者用）
 ```
 
 ## 已知限制（按设计）
 
-- M3-A 刻意最简：无 hash/diff/事件监听/防抖，每秒全量导出+推送（ADR-008）
+- 每次检查仍全量导出（渲染缓存刷新 + 内容检测依赖最新导出），M4-A 优化的是
+  无变化帧的 POST 次数，M4-B 优化的是变化帧的响应延迟（ADR-017/018）
 - 同步 POST 在主线程执行（loopback 实测 1–5ms，详见 DECISIONS ADR-004）
 - 中文画板名经 header 百分号编码传输（ADR-005）
 - 仅支持 `type === 'Artboard'` 的顶层容器（2025.1+ Frames/Graphics 中的 legacy 标记类型）

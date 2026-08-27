@@ -1,9 +1,9 @@
 {
   "compatibleVersion": 3,
-  "bundleVersion": 5,
-  "name": "Sketch LAN Mirror",
+  "bundleVersion": 7,
+  "name": "LAN",
   "identifier": "com.xuezx.sketch-lan-mirror",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "author": "Zhixiang Xue",
   "commands": [
     {
@@ -14,19 +14,34 @@
     },
     {
       "script": "script.cocoascript",
-      "name": "Start Mirror",
+      "name": "Start LAN",
       "identifier": "start-mirror",
-      "handler": "onStartMirror"
+      "handler": "onStartLAN"
     },
     {
       "script": "script.cocoascript",
-      "name": "Stop Mirror",
+      "name": "Stop LAN",
       "identifier": "stop-mirror",
-      "handler": "onStopMirror"
+      "handler": "onStopLAN"
+    },
+    {
+      "script": "script.cocoascript",
+      "name": "Open LAN Viewer",
+      "identifier": "open-lan-viewer",
+      "handler": "onOpenLANViewer"
     }
   ],
   "menu": {
-    "title": "Sketch LAN Mirror",
-    "items": ["send-current-frame", "start-mirror", "stop-mirror"]
+    "title": "LAN",
+    "items": ["send-current-frame", "start-mirror", "stop-mirror", "open-lan-viewer"]
+  },
+  "handlers": {
+    "actions": {
+      "SelectionChanged": "onSelectionChanged",
+      "ArtboardChanged": "onArtboardChanged",
+      "TextChanged": "onTextChanged",
+      "LayersMoved": "onLayersMoved",
+      "LayersResized": "onLayersResized"
+    }
   }
 }

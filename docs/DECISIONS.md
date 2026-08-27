@@ -247,6 +247,178 @@
 - **真机验收：已通过（2026-08-27）**——初次进入即 ih:870/pwa-tight，
   Immersive 进出黑底一致，docInfo 紧贴 Home Indicator 安全区。
 
+## ADR-017 · M4-A 帧变化检测：PNG SHA-256 相同且 artboard 身份一致则跳过 POST
+
+- **背景**：M3-A 基线每 1s tick 全量 `sketch.export()` + POST——画板静止时
+  100 ticks 产生 100 次 export（小画板 ~20ms、大画板 300ms+）+ 100 次 POST，
+  全部是无变化冗余。目标：内容没变就不 POST，手机端行为完全一致。
+- **哈希环境研究结论**（Sketch 2025.3.4 JavaScriptCore，手写 bundle 无构建链）：
+  - 无 Node `crypto`；skpm `Buffer` 原型无 hash 方法；
+  - CommonCrypto `CC_SHA256` 等纯 C 函数无法从 CocoaScript 桥接调用；
+  - `NSData.hash` 不可靠——现代实现只采样首尾字节，同长度中间改动会漏检；
+  - **可用**：CloudKit 框架的 `CKSHA256` Obj-C 类（`ObjC.import('CloudKit')` 后
+    `CKSHA256.digestWithData(nsdata)` 原生速度返回 NSData 摘要）；
+  - 兜底：纯 JS SHA-256（Uint8Array 输入，int32 轮函数 + DataView 写 64 位大端
+    长度字段；与 node crypto 17 种边界长度对拍全通过，含 55/56/57/63/64 分块
+    边界与空向量）。
+- **性能实测**（node/V8 量级，JSC 同数量级参考；`plugin/tools/test-sha256.js`）：
+
+  | PNG 大小 | JS SHA-256 耗时 | 吞吐 |
+  |---|---|---|
+  | 50 KB | 3.6 ms | 13.6 MB/s |
+  | 200 KB | 14.4 ms | 13.6 MB/s |
+  | 500 KB | 36.2 ms | 13.5 MB/s |
+  | 1 MB | 73.0 ms | 13.7 MB/s |
+
+  hash 远小于 export（小画板 20ms、大画板 300ms+），不满足「比 export 慢」
+  的风险条件；主路径 CKSHA256 更快。export 仍每 tick 执行（渲染缓存刷新 +
+  内容检测依赖最新导出），优化的是 POST 次数与 sending 占用。
+- **决策**（`script.cocoascript`，策略链 `pngDigest()`）：
+  1. 每 tick 正常 export → 计算整帧 PNG SHA-256（`pngDigest`：CKSHA256 主路径，
+     失败自动降级纯 JS 并记日志，此后不再重试 CK）；
+  2. 跳过条件三要素：`hash === lastSentHash` **且** `artboardKey ===
+     lastSentArtboardKey` **且** 上次确实成功发送过。artboardKey =
+     `id|name|W×H`（协议无 artboard id，用最小安全身份，防两个不同画板恰好
+     导出相同 PNG 被误跳过）；
+  3. **只有 POST 200 之后**才更新 `lastSentHash/lastSentArtboardKey`——失败帧
+     下个 tick 必然重发，server 恢复后不会「永远认为已发送」；
+  4. Start Mirror 前清空基线（重新 Start 必发首帧）；Stop Mirror 清理基线并
+     输出本次会话 `sent/skipped/avgExport/avgHash/avgPost` 统计（每 30 ticks
+     亦输出一次）；
+  5. 手动 Send Current Frame 不走跳过逻辑（永远发送并刷新基线）；
+  6. 不改协议/WebSocket/Viewer/scale——server 完全未动。
+- **预期效果**（静止画板，100 ticks）：Before 100 exports + 100 POST →
+  After 100 exports（含 hash）+ 1 POST + 99 skipped；修改文字/颜色/移动图层
+  → 下个 tick hash 变化即推送，行为与 M3-C 完全一致。
+
+## ADR-018 · M4-B 事件驱动镜像：事件加速 + 1s 轮询兜底
+
+- **背景**：M4-A 后静止帧不再 POST，但内容变化的响应延迟仍受 1s 轮询限制。
+  目标：普通编辑 < 200–500ms，且绝不牺牲 M3-A 已验证的可靠性。
+- **架构（event-driven acceleration + polling fallback）**：
+
+  ```
+  Action（SelectionChanged / ArtboardChanged / TextChanged / LayersMoved / LayersResized）
+     ↓ 统一入口（不直接 export）
+  scheduleFrameCheck()  ←── 80ms debounce 合并窗口（事件风暴 → 一次检查）
+     ↓
+  runFrameCheck('event') ── 与 1s mirrorTick → runFrameCheck('poll') 完全同一条链路
+     ↓
+  resolveTarget（parent chain，ADR-012）→ 删除抑制（ADR-011）→ export →
+  hash（ADR-017）→ 只有 hash 变化才 POST
+  ```
+
+- **注册的 Actions**（manifest `handlers.actions`）：`SelectionChanged` /
+  `ArtboardChanged` / `TextChanged` / `LayersMoved` / `LayersResized`。
+  依据 ARCHITECTURE.md §3.1 的官方 Actions Reference（2026.2）调研（`ContentsChanged`
+  确认不存在，不注册）；因 sketchtool 通道失效（ADR-009），各 action 的真实触发
+  由插件内探针日志验证——每种 action 前 3 次逐条 log、之后每 50 次 log 一次，
+  Stop 时统计行输出 `events=<总数> eventChecks=<事件检查次数>`。
+- **事件合并（不风暴）**：
+  1. 80ms debounce 窗口（`setTimeout` 运行时原生提供，ADR-008 实测）：窗口内的
+     多个 Action 合并为一次检查——拖动图层产生的事件流每 80ms 至多触发一次 export；
+  2. 检查进行中（`sending=true`）到达的事件不排队，只置 `pendingAfterSend`，
+     当前发送完成后经同一 debounce 窗口补一次检查（仍然 latest-frame-only）；
+  3. 事件**不是发送条件**：是否 POST 仍由 M4-A hash 决定（如选中变化但画板
+     内容没变 → export+hash 后 skip，不产生网络流量）。
+- **1s 轮询保留为兜底**：`mirrorTick` 语义不变，仅内部转调
+  `runFrameCheck('poll')`。事件机制整体失效（未知 action 缺失/不触发）时，
+  行为完全退化为 M4-A，最迟 ~1s 更新。
+- **保持不变的关键语义**（事件路径与轮询路径共用同一条 runFrameCheck）：
+  - parent chain 目标归属（ADR-012）：选 Text/Rect/Image/Group 均向上找 Artboard；
+  - 删除抑制（ADR-011）：事件触发同样走 `artboardExistsOnPage` 检测，删除画板
+    后的自动跳选不推送（回归测试 G）；
+  - 跨 Page 检测（M3-C）、latest-frame-only、hash 门控与「仅 POST 200 更新基线」（ADR-017）；
+  - Start 重置事件状态、Stop 清理 debounce 定时器（`clearTimeout`）。
+- **未采用**：EventBus / 复杂队列 / 高频同步 POST——`running/sending/lastSentHash/
+  currentArtboardId` 状态模型不变（§九）。
+- **延迟观测**：事件路径 POST 成功时 log 追加 `[event→post XXXms]`
+  （debounce 延迟 + export/hash/POST 总耗时），供真机验收对照 < 200–500ms 目标。
+
+## ADR-019 · M4-C 自动 Server 生命周期：runtime.json + PID 精确停止
+
+- **背景**：M3 前 server 由用户/AI 手动 `node server/index.js` 启动，不符合
+  产品化目标。要求：`Start LAN` 自动启动（已运行则复用）、`Stop LAN` 精确
+  停止（绝不误杀用户其他 Node 进程：Vite/Next/AI 工具等）。
+- **生命周期状态**（Server 与 Mirror 解耦，`Server Running ≠ Mirror Running`）：
+
+  ```
+  Start LAN:  probeRunningServer(/health) ─ok→ 复用
+              └─fail→ findNode() → NSTask spawn → 轮询 /health（≤5s）→ ready
+  Stop LAN:   停 Mirror → stopManagedServer()（仅停自己启动的 server）
+  ```
+
+- **实现要点**：
+  1. **复用探测优先于启动**：`GET localhost:<port>/health` 检查
+     `service === 'sketch-lan-mirror'`（从默认端口 9777 起最多探测 20 个
+     端口，匹配 server 的端口递增逻辑）；命中即复用，不重复 spawn。
+  2. **runtime.json**：server 启动成功后写
+     `~/.sketch-lan-mirror/runtime.json`（`{pid, port, startedAt}`）；
+     SIGTERM/SIGINT 时清理该文件并优雅退出（终止 WS 连接、关闭
+     httpServer）。插件重启 Sketch 后可据此快速恢复。
+  3. **PID 精确停止（三重身份验证，禁止 killall/pkill node）**：
+     - 无 runtime.json → 不干预（可能是用户手动启动的 server）；
+     - 验证 1：runtime.json 的 port 上 `/health` 返回本服务；
+     - 验证 2：`ps -p <pid> -o command=` 命令行含 `index.js`；
+     - 全部通过才 `kill -TERM <pid>` 并等待退出（≤3s）；
+     - 任一验证失败 → 视为 stale runtime 记录，仅清理文件不杀进程。
+  4. **Node 发现链**：`NSTask` 环境 PATH（继承登录 shell）→ `/usr/local/bin`
+     → `/opt/homebrew/bin` → nvm/volta/fnm 常见路径逐一探测
+     （`file -b` 或 spawn `--version` 验证）；全部失败 → 弹窗明确提示
+     "LAN requires Node.js"，不静默失败。
+  5. **启动确认**：spawn 后不假设成功，轮询 `/health` 最多 ~5s；超时 →
+     读取 `~/.sketch-lan-mirror/server.log` 尾部作为错误信息展示。
+  6. **不影响 Sketch 启动**：插件加载时不做任何事（无 Action handler
+     触发 server），只有用户主动执行 Start LAN 才 spawn。
+- **分发（方案 B 内嵌）**：Release 包内 `LAN.sketchplugin/Contents/Resources/server/`
+  自带 `node_modules`（ws + qrcode-generator，均无必需依赖，omit optional 后
+  极小）。插件运行时优先找 Resources/server；开发环境（软链安装）回退到
+  仓库 `server/`——同一份代码两种安装形态。用户无需 clone / npm install。
+  选择 B 而非 A（仓库 + 用户 npm install）的理由：目标用户是设计师，
+  「双击安装即用」是 M4-C 核心验收路径；体积代价 <1MB 可接受。
+
+## ADR-020 · M4-C LAN URL 发现 + QR 扫码入口
+
+- **背景**：手机端入口原来是手动输入 `http://<IP>:9777`——IP 因电脑/网络
+  而变，端口可能因占用递增，输入成本高且易错。
+- **LAN URL 发现**（动态，不硬编码任何 IP/网卡名）：
+  - 沿用 M1 已验证的 `os.networkInterfaces()` 全量枚举；
+  - 只保留 IPv4 私有网段（10./172.16-31./192.168.），过滤 loopback 与公网；
+  - **网段排序**：192.168（家庭/办公 Wi-Fi）> 172.16-31 > 10.x（后者更常
+    是 VPN/Tailscale）——排序第一作为 primary，其余作为备选如实展示；
+  - `GET /info` 返回 `{port, urls[], primary}`，插件据此弹窗展示访问入口。
+- **QR Code**：
+  - 依赖选择：`qrcode-generator`（~10KB 纯 JS、零依赖、可在 Node 直接生成
+    SVG 与终端 ASCII）——唯一新增 server 依赖，理由：手写 QR 编码器不可
+    维护，而主流 `qrcode` 包（~100KB+ 依赖 canvas）面向浏览器场景过重。
+  - **两个入口**：
+    1. server 启动时终端直接渲染半块字符 QR（`▀▄█ `）+ primary URL——
+       手动 `node index.js` 的用户立即能扫；
+    2. `GET /qr` 独立页面：primary URL 大 QR + 全部候选地址列表（多网卡
+       场景手机可点选对应网段）——插件菜单 `Open LAN Viewer` 打开此页，
+       为后续「插件面板内嵌 QR」预留扩展点（页面即组件化 SVG）。
+- **安全边界不变**：仍是 Local network only，无鉴权；README 明确声明
+  同一局域网内的任何人都可能访问 Viewer。
+
+## ADR-021 · M4-C 产品标识：LAN + 窗台 Logo
+
+- **背景**：M4-C 从功能原型进入 Productized MVP，需要统一用户可见名称与
+  视觉标识。完整设计过程见 docs/BRAND.md。
+- **命名**：产品名 **LAN**（用户可见：菜单/manifest/README/PWA）；技术名
+  Sketch LAN Mirror 保留于 repository / source / ADR / bundle identifier
+  （`com.xuezx.sketch-lan-mirror`）。
+- **Logo 选型**：5 个「窗台」探索方向中选定 **Concept B 负形窗台**（实心
+  圆角方块 + 底部负空间水平缝 = 窗台线），融合 Concept A 的「sill 左右
+  挑出」特征（下段矩形略宽于上半窗体）。
+  - 选型理由：纯剪影最少元素，黑白反转天然成立；16×16 退化为「方块 +
+    底缝」仍可辨识；负空间最有设计工具气质（区别于传统 SaaS 拼贴）。
+- **实现**：`brand/generate-icons.js` 零依赖程序化绘制（4×4 超采样抗锯齿，
+  圆角矩形覆盖度检测），一次生成全尺寸图标保证几何一致性；输出
+  logo.svg / icon-16~512.png / maskable / favicon.svg。server 引用副本在
+  `server/public/icons/`（白名单静态路由）。
+- **PWA**：manifest name/short_name 均为 `LAN`；icons 指向窗台 mark；
+  普通 Safari URL 与 Add to Home Screen 两条路径均不强制安装。
+
 ## 待验证 / 遗留
 
 - dom Shape 的 `.points` 访问器在 2026.2 JS API 中返回 undefined，圆角设置暂缺
