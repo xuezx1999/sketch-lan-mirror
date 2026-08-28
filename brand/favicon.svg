@@ -1,5 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
   <!-- LAN mark — 负形窗台：上段窗体，下段 sill 左右挑出（docs/BRAND.md Concept B+A） -->
-  <rect x="6" y="5" width="20" height="17" rx="3" fill="currentColor"/>
-  <rect x="2" y="25" width="28" height="3.5" rx="1.75" fill="currentColor"/>
+  <!-- mark 整体 80% 居中：留呼吸空间，更精致 -->
+  <g transform="translate(16,16) scale(0.80) translate(-16,-16)">
+    <rect x="6" y="5" width="20" height="17" rx="3" fill="currentColor"/>
+    <rect x="2" y="25" width="28" height="3.5" rx="1.75" fill="currentColor"/>
+  </g>
 </svg>

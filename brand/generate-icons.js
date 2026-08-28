@@ -2,7 +2,8 @@
 // 用法：node brand/generate-icons.js
 // 绘制 docs/BRAND.md 选定 mark（负形窗台）：
 //   上段窗体 rect(6,5,20,17,r3) + 下段 sill rect(2,25,28,3.5,r1.75)，viewBox 32。
-// 4×4 supersampling 抗锯齿；深底 #111214 + 白 mark（maskable 版 mark 缩至 60% 居中）。
+// 常规图标：纯黑底 + 白 mark，mark 整体 61% 居中；maskable 版另缩至 50%（20% 安全区）。
+// 4×4 supersampling 抗锯齿；深底 #111214 + 白 mark。
 'use strict'
 const fs = require('fs')
 const path = require('path')
@@ -61,18 +62,18 @@ function insideRoundRect(px, py, x, y, w, h, r) {
   return true
 }
 
-// mark 描述（viewBox 32）：窗体 + sill
+// mark 描述（viewBox 32）：窗体 + sill（与窗体严格等宽同 x，下方留窄缝）
 const MARK = [
   { x: 6, y: 5, w: 20, h: 17, r: 3 },   // 窗体
-  { x: 2, y: 25, w: 28, h: 3.5, r: 1.75 }, // sill（左右挑出）
+  { x: 6, y: 25, w: 20, h: 3.5, r: 0.9 }, // sill（等宽，小圆角近似齐头）
 ]
 
 function renderIcon(size, opts) {
   opts = opts || {}
-  const bg = opts.transparent ? [0, 0, 0, 0] : [17, 18, 20, 255] // #111214
+  const bg = opts.transparent ? [0, 0, 0, 0] : [0, 0, 0, 255] // 纯黑 #000
   const fg = [255, 255, 255, 255]
   const scale = size / 32
-  const markScale = opts.markScale || 1
+  const markScale = opts.markScale || 0.61
   const rgba = Buffer.alloc(size * size * 4)
   const SS = 4 // supersample
   for (let py = 0; py < size; py++) {
@@ -82,9 +83,11 @@ function renderIcon(size, opts) {
         for (let sx = 0; sx < SS; sx++) {
           const ux = (px + (sx + 0.5) / SS) / scale
           const uy = (py + (sy + 0.5) / SS) / scale
-          // mark 居中缩放（maskable 用）
-          const mx = 16 + (ux - 16) * markScale
-          const my = 16 + (uy - 16) * markScale
+          // mark 以包围盒中心 (16,16.75) 归一居中缩放；markScale 语义 = mark 高占视框比
+          const cx = 16, cy = 16.75
+          const k = 23.5 / (markScale * 32) // 屏幕高 markScale*32 ↔ mark 高 23.5（k=压缩比）
+          const mx = cx + (ux - cx) * k
+          const my = cy + (uy - cy) * k
           for (const s of MARK) {
             if (insideRoundRect(mx, my, s.x, s.y, s.w, s.h, s.r)) {
               hit++
@@ -110,7 +113,7 @@ const targets = [
   ['icon-180.png', 180, {}],
   ['icon-192.png', 192, {}],
   ['icon-512.png', 512, {}],
-  ['icon-maskable-512.png', 512, { markScale: 0.6 }], // 20% 安全区
+  ['icon-maskable-512.png', 512, { markScale: 0.5 }], // 20% 安全区（mark 高占视框 50%）
 ]
 for (const [name, size, opts] of targets) {
   const out = path.join(__dirname, name)

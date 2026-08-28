@@ -97,6 +97,7 @@
     will-change: transform;
   }
   #normalImg { display: block; -webkit-user-drag: none; pointer-events: none; }
+  #normalImg:not([src]) { display: none; } /* 无 src 时隐藏，避免浏览器 broken-image 默认边框占位 */
   #placeholder {
     position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
@@ -183,7 +184,7 @@
 </header>
 <main>
   <div id="stage">
-    <div id="placeholder">等待第一帧…<br>在 Mac 端向 /frame 推送 PNG</div>
+    <div id="placeholder">等待第一帧…</div>
     <div id="canvas"><img id="normalImg" alt="Artboard preview" draggable="false"></div>
   </div>
 </main>
