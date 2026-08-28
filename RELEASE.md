@@ -15,12 +15,12 @@
 git tag v<X.Y.Z> && git push origin main --tags
 
 # 4. 打包（必须带 LAN_REPO，会写入真实 appcast 更新源并生成 dist/appcast.xml）
-LAN_REPO=xuezx1999/lan ./scripts/package.sh
+LAN_REPO=xuezx1999/sketch-lan-mirror ./scripts/package.sh
 
 # 5. 创建 Release 并上传 zip + appcast
 GH_CONFIG_DIR=/tmp/gh-config /tmp/gh_2.76.2_macOS_arm64/bin/gh release create v<X.Y.Z> \
   dist/LAN-v<X.Y.Z>.zip dist/appcast.xml \
-  --repo xuezx1999/lan \
+  --repo xuezx1999/sketch-lan-mirror \
   --title "LAN v<X.Y.Z> — <一句话主题>" \
   --notes "<changelog 摘要，markdown>"
 

@@ -5,7 +5,7 @@
   "identifier": "com.xuezx.sketch-lan-mirror",
   "version": "0.5.0",
   "author": "Zhixiang Xue",
-  "appcast": "https://github.com/OWNER/REPO/releases/latest/download/appcast.xml",
+  "appcast": "https://github.com/xuezx1999/sketch-lan-mirror/releases/latest/download/appcast.xml",
   "commands": [
     {
       "script": "script.cocoascript",
