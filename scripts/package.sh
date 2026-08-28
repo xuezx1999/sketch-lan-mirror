@@ -1,7 +1,7 @@
 #!/bin/bash
 # LAN — Release 打包脚本（维护者用；最终用户不需要运行本脚本）
-# 产出：dist/LAN-v<version>.zip —— 内含自带 Node runtime + server 的 LAN.sketchplugin
-#       解压 → 双击 LAN.sketchplugin → 正式安装，用户机器无需安装 Node.js
+# 产出：dist/LAN-v<version>.zip —— 内含自带 Node runtime + server 的 览LAN.sketchplugin
+#       解压 → 双击 览LAN.sketchplugin → 正式安装，用户机器无需安装 Node.js
 #       dist/appcast.xml —— Sketch 自动更新清单（需 LAN_REPO，见 docs/RELEASE.md）
 # 用法：./scripts/package.sh
 #       LAN_REPO=owner/repo ./scripts/package.sh   # 生成带真实更新源的包
@@ -18,10 +18,10 @@ CACHE="dist/.cache"
 rm -rf "$DIST"
 mkdir -p "$DIST" "$CACHE"
 
-PLUGIN="$DIST/LAN.sketchplugin"
+PLUGIN="$DIST/览LAN.sketchplugin"
 RES="$PLUGIN/Contents/Resources"
 
-# 1) 插件骨架 → dist/LAN.sketchplugin（Sketch 双击安装的就是这个目录）
+# 1) 插件骨架 → dist/览LAN.sketchplugin（Sketch 双击安装的就是这个目录）
 cp -R plugin/src/sketch-lan-mirror.sketchplugin "$PLUGIN"
 
 # 2) server 内嵌到 Contents/Resources/server（插件运行时优先从这里找 server，
@@ -54,7 +54,7 @@ lipo -create \
   -output "$RES/node"
 rm -rf "$CACHE/node-v$NODE_VERSION-darwin-arm64" "$CACHE/node-v$NODE_VERSION-darwin-x64"
 
-# 4) 使用说明内嵌（插件菜单 Plugins ▸ LAN ▸ Usage 打开）
+# 4) README 内嵌（供脚本内部引用与用户查看）
 cp README.md "$RES/README.md"
 
 # 5) appcast 更新源：LAN_REPO 未设置时从 dist 副本移除（避免占位 URL 404），并跳过 appcast 生成
@@ -78,10 +78,10 @@ PY
   echo "提示：未设置 LAN_REPO，本包不含自动更新源（正式发布时用 LAN_REPO=owner/repo 重新打包）"
 fi
 
-# 6) zip：只含 LAN.sketchplugin（解压即插件，双击即装；不再套版本文件夹和散落 README）
+# 6) zip：只含 览LAN.sketchplugin（解压即插件，双击即装；不再套版本文件夹和散落 README）
 (
   cd "$DIST"
-  zip -rq "LAN-v$VERSION.zip" LAN.sketchplugin -x '*.DS_Store'
+  zip -rq "LAN-v$VERSION.zip" 览LAN.sketchplugin -x '*.DS_Store'
 )
 mv "$DIST/LAN-v$VERSION.zip" "dist/LAN-v$VERSION.zip"
 
@@ -107,7 +107,7 @@ XML
 fi
 
 echo "OK: dist/LAN-v$VERSION.zip"
-echo "    安装方式：解压 → 双击 LAN.sketchplugin → Sketch 菜单 Plugins ▸ LAN ▸ Start LAN"
+echo "    安装方式：解压 → 双击 览LAN.sketchplugin → Sketch 菜单 Plugins ▸ 览LAN ▸ 开启预览 Start LAN"
 if [ -n "${LAN_REPO:-}" ]; then
   echo "    更新源： dist/appcast.xml（与 zip 一起上传到 GitHub Release v${VERSION}）"
 fi

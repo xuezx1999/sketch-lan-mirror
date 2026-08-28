@@ -1,6 +1,6 @@
 {
-  "name": "LAN",
-  "short_name": "LAN",
+  "name": "览LAN",
+  "short_name": "览LAN",
   "description": "Real-time Sketch preview over LAN",
   "start_url": "/",
   "display": "standalone",

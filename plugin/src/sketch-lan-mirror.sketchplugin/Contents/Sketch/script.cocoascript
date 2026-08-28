@@ -165,7 +165,7 @@ function onOpenLANViewer(context) {
   // 未运行 → 明确提示（不隐式启动，保持「Start LAN 才动 Server」的原则）
   var server = probeRunningServer()
   if (!server.ok) {
-    notifyInfo('Start LAN first.\n菜单 Plugins ▸ LAN ▸ Start LAN')
+    notifyInfo('请先开启预览 Start LAN.\n菜单 Plugins ▸ 览LAN ▸ 开启预览 Start LAN')
     return
   }
   var url = 'http://localhost:' + server.port + '/qr'

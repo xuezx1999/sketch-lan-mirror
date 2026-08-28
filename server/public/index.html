@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="LAN">
+<meta name="apple-mobile-web-app-title" content="览LAN">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icons/icon-180.png">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<title>LAN</title>
+<title>览LAN</title>
 <style>
   /* ═══ 1. Reset & App Shell ═══ */
   :root { color-scheme: light dark; }
@@ -152,12 +152,33 @@
     /* pan-y：允许垂直 body 原生滚动（图片到物理屏底），禁止 pinch zoom + 水平 pan（JS 接管） */
     touch-action: pan-y;
   }
+
+  /* ═══ 6. PWA 安装提示（仅手机浏览器首次访问；standalone/桌面/已关闭不显示）═══ */
+  #pwaHint {
+    position: fixed; left: 12px; right: 12px;
+    bottom: calc(env(safe-area-inset-bottom) + 14px);
+    z-index: 10;
+    background: rgba(43, 45, 48, 0.96);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 14px;
+    padding: 14px 14px 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  }
+  #pwaHint .hint-title { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  #pwaHint .hint-body { font-size: 13px; color: #98989d; line-height: 1.5; }
+  #pwaHint button {
+    display: block; margin: 10px 0 2px auto;
+    background: none; border: none;
+    color: #6db3f2; font-size: 14px; font-weight: 600;
+    padding: 4px 8px; cursor: pointer;
+  }
+  body.mode-immersive #pwaHint { display: none; }
 </style>
 </head>
 <body class="mode-normal">
 <header>
   <span class="dot" id="dot"></span>
-  <h1>LAN</h1>
+  <h1>览LAN</h1>
   <span id="statusText">连接中…</span>
 </header>
 <main>
@@ -174,6 +195,11 @@
   <div id="immersiveSpacer">
     <img id="immersiveImg" alt="Artboard 沉浸预览" draggable="false">
   </div>
+</div>
+<div id="pwaHint" hidden>
+  <div class="hint-title">添加到主屏幕，获得沉浸式预览</div>
+  <div class="hint-body" id="pwaHintBody"></div>
+  <button id="pwaHintOk" type="button">知道了</button>
 </div>
 
 <script>
@@ -256,6 +282,9 @@
   var immersiveViewer = document.getElementById('immersiveViewer')
   var immersiveSpacer = document.getElementById('immersiveSpacer')
   var immersiveImg = document.getElementById('immersiveImg')
+  var pwaHint = document.getElementById('pwaHint')
+  var pwaHintBody = document.getElementById('pwaHintBody')
+  var pwaHintOk = document.getElementById('pwaHintOk')
 
   // ══════════════════════════════════════════════════════
   // 3. Normal Viewer（固定视口 + fit + pinch + pan）
@@ -616,10 +645,12 @@
       state.image.dims = { w: w, h: h }
       normalImg.style.width = w + 'px'
       normalImg.style.height = h + 'px'
-      // 画板切换：immersive 退出回 normal；normal 重新 fit
+      // 画板切换：viewer 模式保持不变（immersive 由用户双击显式退出，不因换画板自动退回），
+      // normal 重新 fit；immersive 重置 zoom 并回顶端
       if (state.viewerMode === 'IMMERSIVE') {
-        exitImmersive()
-        normalFit()
+        immersiveImg.src = state.image.objectUrl
+        resetImZoom()  // 清 zoom + scrollTo(0,0) 回顶端
+        renderImmersive()
       } else {
         normalFit()
       }
@@ -739,6 +770,43 @@
   setTimeout(syncStandaloneBottom, 300)
   setTimeout(syncStandaloneBottom, 1000)
   connect()
+
+  // ══════════════════════════════════════════════════════
+  // 9. PWA 安装提示（仅手机浏览器 + 非已安装 + 首次）
+  //    - isStandalone：已在 PWA 内运行 = 已安装 → 不提示
+  //    - 桌面端（无触屏）→ 不提示
+  //    - 用户点「知道了」→ localStorage 记住，之后不再提示
+  //    - iOS Safari 无「是否已安装」探测 API，靠 localStorage 标记兜底
+  //    - iOS 隐私模式 localStorage 会抛异常，try/catch 降级为「每次都提示」
+  // ══════════════════════════════════════════════════════
+  var PWA_HINT_KEY = 'lan-pwa-hint-dismissed'
+  function storageGet(k) { try { return localStorage.getItem(k) } catch (e) { return null } }
+  function storageSet(k, v) { try { localStorage.setItem(k, v) } catch (e) {} }
+
+  function isMobileDevice() {
+    var ua = navigator.userAgent
+    // iPad（iOS 13+ 伪装 Mac UA）用多点触屏兜底识别
+    if (/Android|iPhone|iPad|iPod/i.test(ua)) return true
+    return navigator.maxTouchPoints > 1 && /Mac/i.test(navigator.platform || '')
+  }
+
+  function initPwaHint() {
+    if (isStandalone) return                       // 已是 PWA（已安装）→ 不提示
+    if (storageGet(PWA_HINT_KEY)) return           // 用户关闭过 → 不再提示
+    if (!isMobileDevice()) return                  // 桌面端 → 不提示
+    var ua = navigator.userAgent
+    var isIOS = /iPhone|iPad|iPod/i.test(ua) ||
+      (navigator.maxTouchPoints > 1 && /Mac/i.test(navigator.platform || ''))
+    pwaHintBody.textContent = isIOS
+      ? '在 Safari 中点击底部「分享」按钮，选择「添加到主屏幕」。'
+      : '在浏览器菜单中选择「添加到主屏幕」或「安装应用」。'
+    pwaHint.hidden = false
+    pwaHintOk.addEventListener('click', function () {
+      pwaHint.hidden = true
+      storageSet(PWA_HINT_KEY, '1')
+    })
+  }
+  initPwaHint()
 })()
 </script>
 </body>

@@ -354,11 +354,11 @@ function buildQrPage(primary, urls) {
     .map((u) => `<li><a href="${esc(u)}">${esc(u)}</a></li>`)
     .join('\n')
   return `<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LAN — Scan to open on iPhone</title>
+<title>览LAN — 扫码打开预览</title>
 <style>
   body { font-family: -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
          background: #111214; color: #e8e9ea; display: flex; min-height: 100vh;
@@ -375,11 +375,11 @@ function buildQrPage(primary, urls) {
 </style>
 </head>
 <body>
-<h1>LAN</h1>
+<h1>览LAN</h1>
 <div class="qr">${svg}</div>
-<p class="url">Scan with iPhone &rarr; opens the Viewer<br><a href="${esc(primary)}">${esc(primary)}</a></p>
+<p class="url">手机扫码打开预览 Scan to open the Viewer<br><a href="${esc(primary)}">${esc(primary)}</a></p>
 ${otherRows ? `<ul>${otherRows}</ul>` : ''}
-<p class="open"><a href="/">Open Viewer on this Mac</a></p>
+<p class="open"><a href="/">在本机打开预览 Open Viewer on this Mac</a></p>
 </body>
 </html>`
 }

@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.5.1 — 览LAN Brand & Experience
+
+### Changed
+
+- 品牌统一为「览LAN」：插件名称/菜单标题/发布包 bundle 目录（`览LAN.sketchplugin`）、QR 扫码页、预览网页标题、PWA name/short_name
+- 插件元数据：author 改为 LiminalDrift，新增中文描述（Sketch 画板实时镜像到手机端）
+- 菜单精简为三项并改中英双语：开启预览 Start LAN / 停止预览 Stop LAN / 扫码预览 Open LAN Viewer（移除 Send Current Frame 与 Usage 入口）
+- QR 扫码页文案改为中文，去除 iPhone 字样（安卓同样适用）
+
+### Added
+
+- 插件 icon（128×128 窗台 mark，`Contents/Resources/icon.png` + manifest `icon` 字段，Sketch 插件管理页显示）
+- PWA 安装提示：手机浏览器首次访问弹出「添加到主屏幕」横幅（standalone / 桌面端 / 已关闭则不显示，localStorage 记忆；iOS/Android 分语文案）
+
+### Fixed
+
+- Immersive 模式下切换 Artboard 不再自动退回 Normal（由用户双击显式退出）；切换时重置缩放并回到图片顶端
+
+### Compatibility
+
+- Sketch 2025.3.4
+- macOS（Apple Silicon / Intel）
+- iPhone / Android Safari 及主流浏览器
+
+---
+
 ## v0.5.0 — M4-D Single-file Distribution
 
 ### Added

@@ -1,46 +1,36 @@
 {
   "compatibleVersion": 3,
   "bundleVersion": 8,
-  "name": "LAN",
+  "name": "览LAN",
   "identifier": "com.xuezx.sketch-lan-mirror",
-  "version": "0.5.0",
-  "author": "Zhixiang Xue",
+  "version": "0.5.1",
+  "author": "LiminalDrift",
+  "description": "Sketch 画板实时镜像到手机端 —— 局域网无线预览，扫码即看。",
+  "icon": "icon.png",
   "appcast": "https://github.com/xuezx1999/sketch-lan-mirror/releases/latest/download/appcast.xml",
   "commands": [
     {
       "script": "script.cocoascript",
-      "name": "Send Current Frame",
-      "identifier": "send-current-frame",
-      "handler": "onRun"
-    },
-    {
-      "script": "script.cocoascript",
-      "name": "Start LAN",
+      "name": "开启预览 Start LAN",
       "identifier": "start-mirror",
       "handler": "onStartLAN"
     },
     {
       "script": "script.cocoascript",
-      "name": "Stop LAN",
+      "name": "停止预览 Stop LAN",
       "identifier": "stop-mirror",
       "handler": "onStopLAN"
     },
     {
       "script": "script.cocoascript",
-      "name": "Open LAN Viewer",
+      "name": "扫码预览 Open LAN Viewer",
       "identifier": "open-lan-viewer",
       "handler": "onOpenLANViewer"
-    },
-    {
-      "script": "script.cocoascript",
-      "name": "Usage",
-      "identifier": "show-usage",
-      "handler": "onShowUsage"
     }
   ],
   "menu": {
-    "title": "LAN",
-    "items": ["send-current-frame", "start-mirror", "stop-mirror", "open-lan-viewer", "-", "show-usage"]
+    "title": "览LAN",
+    "items": ["start-mirror", "stop-mirror", "-", "open-lan-viewer"]
   },
   "handlers": {
     "actions": {
