@@ -7,11 +7,11 @@
 	<key>CFBundleIdentifier</key>
 	<string>com.xuezx.sketch-lan-mirror</string>
 	<key>CFBundleName</key>
-	<string>览LAN</string>
+	<string>📺 览LAN</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.5.1</string>
+	<string>0.5.2</string>
 	<key>CFBundleVersion</key>
-	<string>8</string>
+	<string>9</string>
 	<key>NSPrincipalClass</key>
 	<string>NSString</string>
 </dict>

@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.5.2 — Plugins Menu Emoji
+
+### Changed
+
+- 插件名称/菜单标题增加 📺 前缀（`📺 览LAN`）：Sketch「插件」下拉菜单不渲染 manifest 的 `icon` 字段（仅「管理插件」面板显示），名称前缀 emoji 是下拉菜单显示图标的唯一方式（蓝湖 🐳、Kitchen 👨‍🍳 同理）
+
+### Compatibility
+
+- Sketch 2025.3.4
+- macOS（Apple Silicon / Intel）
+- iPhone / Android Safari 及主流浏览器
+
+---
+
 ## v0.5.1 — 览LAN Brand & Experience
 
 ### Changed

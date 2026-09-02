@@ -1,9 +1,9 @@
 {
   "compatibleVersion": 3,
-  "bundleVersion": 8,
+  "bundleVersion": 9,
   "name": "📺 览LAN",
   "identifier": "com.xuezx.sketch-lan-mirror",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "author": "LiminalDrift",
   "description": "Sketch 画板实时镜像到手机端 —— 局域网无线预览，扫码即看。",
   "icon": "icon.png",
