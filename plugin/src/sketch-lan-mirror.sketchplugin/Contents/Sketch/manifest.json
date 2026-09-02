@@ -1,7 +1,7 @@
 {
   "compatibleVersion": 3,
   "bundleVersion": 8,
-  "name": "览LAN",
+  "name": "📺 览LAN",
   "identifier": "com.xuezx.sketch-lan-mirror",
   "version": "0.5.1",
   "author": "LiminalDrift",
@@ -29,7 +29,7 @@
     }
   ],
   "menu": {
-    "title": "览LAN",
+    "title": "📺 览LAN",
     "items": ["start-mirror", "stop-mirror", "-", "open-lan-viewer"]
   },
   "handlers": {
