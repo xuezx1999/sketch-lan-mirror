@@ -6,6 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="览LAN">
+<meta name="theme-color" content="#111214">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icons/icon-180.png">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
@@ -15,6 +16,8 @@
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; overscroll-behavior: none; }
+  /* html 深色底：body 透明/未渲染间隙（pwa-boot、启动 race）不再露 WebView 白底 */
+  html { background: #111214; }
   body {
     font-family: -apple-system, "SF Pro Text", "PingFang SC", sans-serif;
     background: #111214;
@@ -65,6 +68,12 @@
      重算为全屏（复刻 immersive 可滚动 body 触发重算的机制），期间隐藏内容
      避免重算位移可见；超时未成功则移除，回退 pwa-strip 兜底 */
   body.pwa-boot { height: calc(100dvh + 2px); overflow-y: auto; opacity: 0; }
+  /* 白屏兜底（v0.5.3）：iOS PWA 冷启动时主线程/timer 可能被冻结，interval
+     摘不掉 pwa-boot → opacity:0 永久白屏（PWA 重开必现、Safari 正常的根因）。
+     CSS 动画由合成线程驱动，JS 冻结也能执行：1.6s 后强制恢复可见。
+     JS 正常时 class 在 1.05s（21×50ms）内已移除，动画 delay 未到、零副作用 */
+  @keyframes pwa-boot-recover { to { opacity: 1 } }
+  body.pwa-boot { animation: pwa-boot-recover 0.25s ease-out 1.6s forwards; }
 
   /* ═══ 2. Header ═══ */
   header { display: flex; align-items: center; gap: 10px; flex: none; }
@@ -252,19 +261,24 @@
   // PWA 启动视口重算：首帧视口被 iOS 砍短（gap>15）时，临时让 body 溢出 2px
   // 触发 iOS 把视口重算为全屏（与 immersive 可滚动 body 触发重算同机制），
   // 期间 opacity:0 隐藏内容避免重算位移可见；1s 内未成功则放弃，回退 pwa-strip。
+  // 白屏防御：摘除 pwa-boot 不能只依赖 interval——iOS 冷启动时 timer 可能被
+  // 冻结/深度节流，opacity:0 挂死即永久白屏。故暴露 cleanupBootRecalc()，
+  // visibilitychange 转可见时主动摘除（CSS 动画兜底之外的第二通道）。
+  var bootTimer = null
+  function cleanupBootRecalc() {
+    if (bootTimer) { clearInterval(bootTimer); bootTimer = null }
+    document.body.classList.remove('pwa-boot')
+    syncStandaloneBottom()
+  }
   function bootViewportRecalc() {
     if (!isStandalone) return
     if (Math.round(window.screen.height - window.innerHeight) <= 15) return
     document.body.classList.add('pwa-boot')
     var tries = 0
-    var timer = setInterval(function () {
+    bootTimer = setInterval(function () {
       tries++
       var gap = Math.round(window.screen.height - window.innerHeight)
-      if (gap <= 15 || tries > 20) {
-        clearInterval(timer)
-        document.body.classList.remove('pwa-boot')
-        syncStandaloneBottom()
-      }
+      if (gap <= 15 || tries > 20) cleanupBootRecalc()
     }, 50)
   }
 
@@ -753,6 +767,9 @@
 
   document.addEventListener('visibilitychange', function () {
     if (document.visibilityState !== 'visible') return
+    // 冷启动 race：timer 被冻结时 pwa-boot 可能仍挂着（opacity:0 → 白屏）。
+    // 页面转可见即摘除，宁放弃视口重算窗口（回退 pwa-strip 条带布局）也不白屏
+    if (document.body.classList.contains('pwa-boot')) cleanupBootRecalc()
     syncStandaloneBottom()
     if (!ws || ws.readyState > 1) connect()
     else catchUp()
