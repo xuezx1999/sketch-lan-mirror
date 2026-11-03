@@ -15,7 +15,11 @@ MANIFEST="plugin/src/sketch-lan-mirror.sketchplugin/Contents/Sketch/manifest.jso
 VERSION=$(python3 -c "import json;print(json.load(open('$MANIFEST'))['version'])")
 DIST="dist/LAN-v$VERSION"
 CACHE="dist/.cache"
-rm -rf "$DIST"
+# 不删旧产物（rm -rf 目录会触发批量删除保护）：移到缓存目录留待人工清理
+if [ -e "$DIST" ]; then
+  mkdir -p "$CACHE"
+  mv "$DIST" "$CACHE/old-LAN-v$VERSION-$(date +%Y%m%d-%H%M%S)"
+fi
 mkdir -p "$DIST" "$CACHE"
 
 PLUGIN="$DIST/览LAN.sketchplugin"
@@ -26,9 +30,9 @@ cp -R plugin/src/sketch-lan-mirror.sketchplugin "$PLUGIN"
 
 # 2) server 内嵌到 Contents/Resources/server（插件运行时优先从这里找 server，
 #    开发软链模式自动回退到仓库 server/——见 script.cocoascript findServerDir）
+#    rsync 排除 node_modules：直接拷再删会触发批量删除保护，也白拷一份依赖
 mkdir -p "$RES"
-cp -R server "$RES/server"
-rm -rf "$RES/server/node_modules"
+rsync -a --exclude node_modules --exclude .DS_Store server/ "$RES/server/"
 rm -f "$RES/server/package-lock.json"
 (
   cd "$RES/server"

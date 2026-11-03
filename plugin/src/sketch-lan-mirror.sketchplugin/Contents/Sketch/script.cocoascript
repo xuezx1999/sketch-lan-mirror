@@ -74,9 +74,21 @@ function onRun(context) {
 }
 
 function onStartLAN(context) {
+  // SLM.running 只代表「Mirror 轮询定时器还在」，不代表 server 进程还活着
+  // （进程可能被系统回收、清理工具或外部 kill 掉）。若只看这个标记就短路，
+  // 会卡进「Start 提示已在运行 / Open LAN Viewer 提示请先 Start」的死锁：
+  // 两边判断依据不同，谁也走不下去。所以先验 server 存活，只有两者都在才短路。
   if (SLM.running) {
-    notifyInfo('LAN is already running')
-    return
+    if (probeRunningServer().ok) {
+      notifyInfo('LAN is already running')
+      return
+    }
+    log('[LAN Mirror] server lost while mirror flagged running — resetting and restarting')
+    clearInterval(SLM.timerId)
+    SLM.timerId = null
+    SLM.running = false
+    SLM.suppressedArtboardId = null
+    SLM.currentPageId = null
   }
 
   // M4-C（ADR-019）：先确保 Server 运行（复用/自动启动），再启动 Mirror。
@@ -165,7 +177,11 @@ function onOpenLANViewer(context) {
   // 未运行 → 明确提示（不隐式启动，保持「Start LAN 才动 Server」的原则）
   var server = probeRunningServer()
   if (!server.ok) {
-    notifyInfo('请先开启预览 Start LAN.\n菜单 Plugins ▸ 览LAN ▸ 开启预览 Start LAN')
+    // 区分两种「没开」：Server 真的没起，还是 Mirror 标记残留但进程已死。
+    // 后者最容易让人卡死 —— 用户以为在跑，一直点 Start 却只得到「已在运行」。
+    notifyInfo(SLM.running
+      ? 'Server 已停止（预览标记残留）。\n请重新执行 开启预览 Start LAN。'
+      : '请先开启预览 Start LAN.\n菜单 Plugins ▸ 览LAN ▸ 开启预览 Start LAN')
     return
   }
   var url = 'http://localhost:' + server.port + '/qr'

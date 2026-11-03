@@ -69,11 +69,26 @@ function getLanAddresses() {
   return [...seen].sort((a, b) => rank(a) - rank(b))
 }
 
+// ── mDNS（Bonjour）入口 ──────────────────────────────────
+// 主屏 PWA 的 origin 在「添加到主屏」那一刻就固定了，之后 DHCP 换 IP 或端口漂移
+// 都会让旧图标永久白屏（iOS 无 SW 兜底：http://<ip> 不是 secure context，注册不了 SW）。
+// .local 名靠 mDNS 解析，IP 变了仍可达，作为「IP 漂移」的后备入口 —— 不替换 IP 入口，
+// 因为部分企业 Wi-Fi 屏蔽组播时 .local 不可用，此时必须还能退回 IP。
+function mdnsHost() {
+  const raw = String(os.hostname() || '').trim().replace(/\.local\.?$/i, '')
+  if (!raw) return null
+  // Bonjour 名只允许字母/数字/连字符；含空格、下划线等在跨网段解析时不可靠，直接放弃
+  if (!/^[A-Za-z0-9-]+$/.test(raw)) return null
+  return `${raw}.local`
+}
+
 function lanInfo(port) {
   const lanIPs = getLanAddresses()
   const urls = lanIPs.map((ip) => `http://${ip}:${port}`)
   const primary = urls[0] || `http://localhost:${port}`
-  return { urls, primary, lanIPs }
+  const host = mdnsHost()
+  const lanHost = host ? `http://${host}:${port}` : null
+  return { urls, primary, lanIPs, lanHost }
 }
 
 // ── HTTP 路由 ─────────────────────────────────────────────
@@ -102,18 +117,18 @@ function onRequest(req, res) {
 
   // M4-C（ADR-019）：插件 / 终端获取访问入口（端口 + LAN URL 列表 + primary）
   if (req.method === 'GET' && pathname === '/info') {
-    const { urls, primary } = lanInfo(httpPort)
+    const { urls, primary, lanHost } = lanInfo(httpPort)
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
-    res.end(JSON.stringify({ ok: true, service: SERVICE, port: httpPort, urls, primary }))
+    res.end(JSON.stringify({ ok: true, service: SERVICE, port: httpPort, urls, primary, lanHost }))
     return
   }
 
   // M4-C（ADR-019）：扫码入口页——Mac 浏览器打开，手机扫码直连 Viewer。
   // 独立页面，不改动 M3-C Viewer（/）本身。
   if (req.method === 'GET' && pathname === '/qr') {
-    const { urls, primary } = lanInfo(httpPort)
+    const { urls, primary, lanHost } = lanInfo(httpPort)
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
-    res.end(buildQrPage(primary, urls))
+    res.end(buildQrPage(primary, urls, lanHost))
     return
   }
 
@@ -345,7 +360,7 @@ function printBanner(port) {
 }
 
 // ── /qr 扫码入口页（极简静态 HTML，QR 内联 SVG）──────────────
-function buildQrPage(primary, urls) {
+function buildQrPage(primary, urls, lanHost) {
   const qr = qrMatrix(primary)
   const svg = qr.createSvgTag({ cellSize: 10, margin: 3 })
   const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -353,6 +368,15 @@ function buildQrPage(primary, urls) {
     .slice(1)
     .map((u) => `<li><a href="${esc(u)}">${esc(u)}</a></li>`)
     .join('\n')
+  // 主屏 PWA 的 origin 添加即固定：用 IP 添加后，DHCP 换 IP 会让旧图标永久白屏。
+  // .local 为备用入口（mDNS 解析），不可用时仍可退回上面的 IP。
+  const hostBlock = lanHost
+    ? `<div class="host">
+  <div class="host-title">添加到主屏时，建议先用这个地址打开</div>
+  <a href="${esc(lanHost)}">${esc(lanHost)}</a>
+  <div class="host-note">IP 变了它仍能访问；若打不开（企业 Wi-Fi 常屏蔽 Bonjour），退回上面的 IP 地址即可。</div>
+</div>`
+    : ''
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -370,6 +394,11 @@ function buildQrPage(primary, urls) {
   .url a { color: #6db3f2; text-decoration: none; }
   ul { list-style: none; padding: 0; font-size: 13px; color: #9a9c9e; }
   ul a { color: #6db3f2; text-decoration: none; }
+  .host { max-width: 460px; background: #1b1c1f; border: 1px solid rgba(255,255,255,0.08);
+          border-radius: 12px; padding: 12px 14px; font-size: 13px; }
+  .host-title { font-weight: 600; margin-bottom: 6px; }
+  .host a { color: #6db3f2; text-decoration: none; word-break: break-all; }
+  .host-note { color: #7d7f82; margin-top: 6px; line-height: 1.5; }
   .open a { color: #fff; text-decoration: none; background: #2b2d30;
             padding: 8px 18px; border-radius: 10px; font-size: 14px; }
 </style>
@@ -378,6 +407,7 @@ function buildQrPage(primary, urls) {
 <h1>览LAN</h1>
 <div class="qr">${svg}</div>
 <p class="url">手机扫码打开预览 Scan to open the Viewer<br><a href="${esc(primary)}">${esc(primary)}</a></p>
+${hostBlock}
 ${otherRows ? `<ul>${otherRows}</ul>` : ''}
 <p class="open"><a href="/">在本机打开预览 Open Viewer on this Mac</a></p>
 </body>

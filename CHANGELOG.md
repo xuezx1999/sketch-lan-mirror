@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.5.4 — Start/Stop 状态错分修复 + mDNS 备用入口
+
+### Fixed
+
+- **「开启预览」提示已在运行、「扫码预览」却提示请先开启预览**：两条命令判断依据不一致——Start 只看内存标记 `SLM.running`（仅代表 Mirror 轮询定时器在），Open LAN Viewer 却用 `/health` 探活。server 进程被系统回收或外部终止后两者分裂，用户彻底卡死（Start 拒绝执行、Viewer 打不开）。现在 Start 先校验 server 存活，仅在「定时器在 **且** server 活着」时才短路；若标记残留则清定时器、重置状态并正常重启。
+- Open LAN Viewer 的提示区分两种情形：`Server 已停止（预览标记残留）` 与从未启动，不再误导用户反复点 Start。
+
+### Added
+
+- **mDNS（`.local`）备用入口**：主屏 PWA 的 origin 在添加那一刻即固定，用 IP 添加后 DHCP 换 IP 会让旧图标永久白屏（`http://<ip>` 非 secure context，注册不了 Service Worker，无离线兜底）。`/info` 新增 `lanHost` 字段，`/qr` 页在二维码下方展示 `.local` 地址并建议用它添加到主屏；Bonjour 被屏蔽时仍可退回 IP。IP 入口与端口递增策略保持不变。
+
+### Compatibility
+
+- Sketch 2025.3.4
+
+- macOS（Apple Silicon / Intel）
+
+- iPhone / Android Safari 及主流浏览器
+
+***
+
 ## v0.5.3 — PWA 重开白屏修复
 
 ### Fixed

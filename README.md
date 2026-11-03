@@ -24,6 +24,8 @@ Sketch ──LAN──► iPhone
 4. **Scan QR code with iPhone** — Mac 上 `Plugins ▸ LAN ▸ Open LAN Viewer` 打开扫码页，手机扫码
 5. **Open Viewer** — 手机 Safari 打开，立即看到当前选中的 Artboard
 6. **Optionally Add to Home Screen** — Safari 分享 → 添加到主屏幕，之后从桌面直达（PWA）
+   - 添加前建议先用 `.local` 地址打开（如 `http://Your-Mac.local:9777`，扫码页上有）：主屏图标的 origin 在添加那一刻就固定了，用 IP 添加的话，Mac 的 DHCP 换 IP 后旧图标会永久白屏（iOS 上 `http://<ip>` 不是 secure context，注册不了 Service Worker，没有离线兜底）
+   - `.local` 依赖 Bonjour；企业 Wi-Fi 屏蔽组播时它打不开，退回 IP 地址即可
 
 使用中有疑问：菜单 `Plugins ▸ LAN ▸ Usage` 查看内嵌使用说明。
 不需要终端运行 `node`，不需要理解 localhost / port / WebSocket。
